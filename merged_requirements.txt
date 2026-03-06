@@ -1,0 +1,19 @@
+# === VGGT 核心依赖 ===
+numpy==1.26.3
+Pillow==10.2.0
+huggingface_hub==0.27.1
+einops==0.6.1
+safetensors==0.5.1
+
+# === TravelUAV 核心依赖 ===
+accelerate==0.21.0
+timm==0.6.13
+peft==0.4.0
+#airsim==1.8.1
+opencv-python==4.10.0.84
+gradio==3.35.2
+scikit-learn==1.2.2
+matplotlib==3.10.0
+pandas==2.2.3
+
+# (你可以将 TravelUAV requirement.txt 中的其余常规库复制到这里，但请去掉 triton==2.0.0)

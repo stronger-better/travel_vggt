@@ -1,0 +1,43 @@
+# =========================
+# 1. 训练日志与输出目录
+# =========================
+wandb/
+work_dirs/
+outputs/
+logs/
+*.log
+
+# =========================
+# 2. 模型权重与断点 (DeepSpeed/PyTorch)
+# =========================
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+checkpoint-*/
+zero_pp_rank_*
+model_zoo/
+
+# =========================
+# 3. 数据集与缓存
+# =========================
+data/
+dataset/
+*.npy
+*.tensor
+*.h5
+*.lmdb
+__pycache__/
+*.pyc
+.cache/
+
+# =========================
+# 4. 环境与系统生成文件
+# =========================
+.env
+venv/
+env/
+.vscode/
+.idea/
+.DS_Store

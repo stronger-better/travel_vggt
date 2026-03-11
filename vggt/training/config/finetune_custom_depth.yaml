@@ -1,0 +1,197 @@
+defaults:
+  - default_dataset.yaml
+  - _self_
+
+exp_name: finetune_custom_depth
+img_size: 518
+num_workers: 8
+seed_value: 42
+accum_steps: 2
+patch_size: 14
+val_epoch_freq: 5
+max_img_per_gpu: 48
+
+limit_train_batches: 800
+limit_val_batches: 400
+
+data:
+  train:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu}
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+      debug: False
+      repeat_batch: False
+      training: True
+      inside_random: True
+      load_depth: True
+      img_nums: [2, 24]  # 每个batch使用2-24张图像
+      allow_duplicate_img: True
+      get_nearby: True
+      augs:
+        cojitter: True
+        cojitter_ratio: 0.3
+        scales: [0.8, 1.2]
+        aspects: [0.33, 1.0]
+        color_jitter:
+          brightness: 0.5
+          contrast: 0.5
+          saturation: 0.5
+          hue: 0.1
+          p: 0.9
+        gray_scale: True
+        gau_blur: False
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        # 使用处理后的自定义深度数据集
+        - _target_: data.datasets.custom_depth.CustomDepthDataset
+          split: train
+          DATASET_DIR: /mnt/sfs_turbo_new/R10844/zhangpeilun/vggt/data/depth   # 修改为process_mpsd.py的输出路径
+          min_num_images: 2
+          len_train: 10000  # 训练集样本数量，根据实际数据调整
+          image_ext: ".jpg"
+          depth_ext: ".npy"  # process_mpsd.py输出的是.npy格式
+          depth_scale: 1.0   # 深度图已经是米为单位，不需要缩放
+          max_depth: 100.0   # 最大深度值（米）
+  val:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    max_img_per_gpu: ${max_img_per_gpu}
+    common_config:
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+      debug: False
+      training: False
+      inside_random: True
+      load_depth: True
+      img_nums: [2, 12]  # 验证时使用2-12张图像
+      allow_duplicate_img: True
+      get_nearby: True
+      augs:
+        cojitter: False
+        cojitter_ratio: 0.5
+        scales: null
+        aspects: [1.0, 1.0]
+        color_jitter: null
+        gray_scale: False
+        gau_blur: False
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.custom_depth.CustomDepthDataset
+          split: test
+          DATASET_DIR: /mnt/sfs_turbo_new/R10844/zhangpeilun/vggt/data/depth # 修改为process_mpsd.py的输出路径
+          min_num_images: 2
+          len_test: 1000  # 验证集样本数量，根据实际数据调整
+          image_ext: ".jpg"
+          depth_ext: ".npy"
+          depth_scale: 1.0
+          max_depth: 100.0
+
+logging:
+  log_dir: logs/${exp_name}
+  log_visuals: False
+  log_freq: 10
+  log_level_primary: INFO
+  log_level_secondary: WARNING
+  all_ranks: False
+  tensorboard_writer:
+    _target_: train_utils.tb_writer.TensorBoardLogger
+    path: ${logging.log_dir}/tensorboard
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - loss_objective
+        - loss_reg_depth
+        - loss_grad_depth
+        - loss_conf_depth
+    val:
+      keys_to_log:
+        - loss_objective
+        - loss_reg_depth
+        - loss_grad_depth
+        - loss_conf_depth
+
+checkpoint:
+  save_dir: logs/${exp_name}/ckpts
+  save_freq: 5
+  resume_checkpoint_path: /mnt/sfs_turbo_new/R10844/zhangpeilun/vggt/checkpoints/model.pt  # 修改为预训练模型路径
+  strict: False  # 设置为False以允许部分加载
+
+loss:
+  _target_: loss.MultitaskLoss
+  # 只启用深度损失，禁用相机和点损失
+  camera: null
+  depth:
+    weight: 1.0
+    gradient_loss_fn: "grad"  # 使用梯度损失
+    valid_range: 0.98
+  point: null
+  track: null
+
+optim:
+  param_group_modifiers: False
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 1e-5  # 微调时使用较小的学习率
+    weight_decay: 0.05
+
+  # 冻结除深度头外的所有模块
+  frozen_module_names:
+    - "*aggregator*"  # 冻结聚合器 
+    # 注意：depth_head 不会被冻结，可以训练
+
+  amp:
+    enabled: True
+    amp_dtype: bfloat16
+  gradient_clip:
+    _target_: train_utils.gradient_clip.GradientClipper
+    configs:
+      - module_name: ["depth"]
+        max_norm: 1.0
+        norm_type: 2
+  options:
+    lr:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+          schedulers:
+            - _target_: fvcore.common.param_scheduler.LinearParamScheduler
+              start_value: 1e-8
+              end_value: 1e-5
+            - _target_: fvcore.common.param_scheduler.CosineParamScheduler
+              start_value: 1e-5
+              end_value: 1e-8
+          lengths: [0.1, 0.9]
+          interval_scaling: ['rescaled', 'rescaled']
+    weight_decay:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+          value: 0.05
+
+max_epochs: 20
+
+model:
+  _target_: vggt.models.vggt.VGGT
+  enable_camera: False  # 禁用相机头
+  enable_depth: True   # 启用深度头
+  enable_point: False  # 禁用点预测
+  enable_track: False  # 禁用轨迹预测
+
+distributed:
+  backend: nccl
+  comms_dtype: None
+  find_unused_parameters: True  # 设置为True，因为有些模块被冻结
+  timeout_mins: 30
+  gradient_as_bucket_view: True
+  bucket_cap_mb: 25
+  broadcast_buffers: True
+
+cuda:
+  cudnn_deterministic: False
+  cudnn_benchmark: False
+  allow_tf32: True
+

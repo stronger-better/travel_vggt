@@ -1,0 +1,265 @@
+#    Copyright 2023 Haotian Liu
+#
+#    Licensed under the Apache License, Version 2.0 (the "License");
+#    you may not use this file except in compliance with the License.
+#    You may obtain a copy of the License at
+#
+#        http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS,
+#    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#    See the License for the specific language governing permissions and
+#    limitations under the License.
+
+from typing import List, Optional, Tuple, Union
+
+import torch
+import torch.nn as nn
+from torch.nn import CrossEntropyLoss
+import torch.nn.functional as F
+
+from transformers import AutoConfig, AutoModelForCausalLM, LlamaConfig
+
+from llamavid.model.llamavid_arch import LLaMAVIDMetaModel, LLaMAVIDMetaForCausalLM
+from llamavid.model.language_model.llama_uav import LlamaUAVModel, LlamaUAVForCausalLM, CausalLMOutputWithPastUAV, CausalLMOutputWithPastUAVMulLoss
+
+from llamavid.constants import WAYPOINT_LABEL_TOKEN
+
+from vggt.models.vggt import VGGT
+
+class LlavaConfig(LlamaConfig):
+    model_type = "llava"
+
+class LlavaAttLlamaModel(LLaMAVIDMetaModel, LlamaUAVModel):
+    config_class = LlavaConfig
+
+    def __init__(self, config: LlamaConfig):
+        super(LlavaAttLlamaModel, self).__init__(config)
+ 
+        
+class CosineDirectionLoss(nn.Module):
+    def __init__(self):
+        super(CosineDirectionLoss, self).__init__()
+    
+    def forward(self, vec1, vec2):
+        cosine_sim = F.cosine_similarity(vec1, vec2, dim=-1)
+        loss = 1 - cosine_sim
+        return loss.mean()
+    
+
+class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
+    config_class = LlavaConfig
+    def __init__(self, config, **model_args):
+        super(LlamaUAVForCausalLM, self).__init__(config)
+        self.model = LlavaAttLlamaModel(config)
+        self.use_angle_and_norm_loss = model_args.get('use_angle_and_norm_loss', True)
+        # self.
+        # TODO: set LLaMAVIDMetaForCausalLM config
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        
+        self.waypoint_emb = nn.Embedding(1, config.hidden_size)
+        self.waypoints_fc = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(config.hidden_size // 2, 64),
+        )
+        self.waypoints_output = nn.Linear(64, 4)
+        
+        self.history_preprocessor = nn.Sequential(
+            nn.Linear(3, 4096 // 2),
+            nn.ReLU(),
+            nn.Linear(4096 // 2, 4096),
+        )
+        
+        # ==========================================
+        # VGGT Latent 提取器 初始化
+        # ==========================================
+        self.vggt_model = VGGT(
+            img_size=224, 
+            patch_size=14,
+            embed_dim=1024,
+            enable_camera=False, 
+            enable_point=False, # 关闭所有预测头以节省显存，只用 Latent
+            enable_depth=False, 
+            enable_track=False
+        )
+        self.vggt_model.eval()
+        for param in self.vggt_model.parameters():
+            param.requires_grad = False
+            
+        # VGGT Latent Token Projector
+        # 输入: [B*S, 1024, 16, 16] (假设224分辨率，14 Patch)
+        self.vggt_latent_projector = nn.Sequential(
+            nn.Conv2d(2048, config.hidden_size, kernel_size=2, stride=2), # 下采样: 16x16 -> 8x8
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d((2, 2)), # 池化到 2x2，每个视角提供 4 个 3D 几何特征 Token
+            nn.Conv2d(config.hidden_size, config.hidden_size, kernel_size=1) 
+        )
+
+        self.waypoints_loss_func = torch.nn.L1Loss()
+        self.angle_loss_func = CosineDirectionLoss()
+        self.waypoint_loss_scale = 1.0
+        self.special_token_dict = None
+
+        # Initialize weights and apply final processing
+        self.post_init()
+    
+    def get_special_token_id(self, special_token_dict):
+        self.special_token_dict = special_token_dict
+        
+    def get_model(self):
+        return self.model
+    
+    def forward_waypoint(self, hidden_states):
+        bs, hidden_size = hidden_states.size()
+        waypoints_feature = self.waypoints_fc(hidden_states.reshape(-1, hidden_size))
+        
+        predicted_waypoints = self.waypoints_output(waypoints_feature)
+        return predicted_waypoints
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        images: Optional[torch.FloatTensor] = None,
+        vggt_images: Optional[torch.FloatTensor] = None, # [新增] VGGT 数据流
+        prompts: Optional[List[str]] = None,
+        waypoints: Optional[torch.FloatTensor] = None,
+        orientations: Optional[torch.FloatTensor] = None,
+        historys: Optional[torch.FloatTensor] = None,
+        return_dict: Optional[bool] = None,
+        return_waypoints: Optional[bool] = False,
+    ) -> Union[Tuple, CausalLMOutputWithPastUAV]:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if not self.training:
+            if images[0].device != self.device:
+                if type(images) is not list:
+                    images = images.to(device=self.device)
+                else:
+                    images = [image.to(device=self.device) for image in images]
+            if input_ids.device != self.device:
+                input_ids = input_ids.to(device=self.device)
+            if attention_mask.device != self.device:
+                attention_mask = attention_mask.to(device=self.device)
+            if labels.device != self.device:
+                labels = labels.to(device=self.device)
+            
+            # [修改点 1] 移动 device 的逻辑补齐
+            if vggt_images is not None and vggt_images.device != self.device: 
+                vggt_images = vggt_images.to(device=self.device)    
+                
+        # import ipdb; ipdb.set_trace()
+        if type(images) is not list:
+            images = images.to(dtype=self.dtype)
+        else:
+            images = [image.to(dtype=self.dtype) for image in images]
+            
+        # [修改点 2] 补全 vggt_images 的数据精度转换 (半精度 fp16/bf16 对齐)
+        if vggt_images is not None:
+            vggt_images = vggt_images.to(dtype=self.dtype)
+        
+        history_embeds = []
+        
+        for idx in range(len(historys)):
+            history = historys[idx]
+            info = history.view(-1, 3)
+            history_embed = self.history_preprocessor(info)
+            history_embeds.append(history_embed)
+            
+        # [修改点 3] 将 vggt_images 传给底层特征提取方法
+        input_ids, attention_mask, past_key_values, inputs_embeds, labels = self.prepare_inputs_labels_for_multimodal(
+            input_ids, attention_mask, past_key_values, labels, images, 
+            prompts=prompts, historys=history_embeds, special_token_dict=self.special_token_dict,
+            vggt_images=vggt_images 
+        )
+        
+        inputs_embeds = inputs_embeds.to(dtype=self.waypoint_emb.weight.dtype)
+        inputs_embeds[labels == WAYPOINT_LABEL_TOKEN] = self.waypoint_emb.weight
+        
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict
+        )
+        hidden_states = outputs[0]
+        waypoints_feat = hidden_states[labels == WAYPOINT_LABEL_TOKEN]     
+        predicted_waypoints = self.forward_waypoint(waypoints_feat)
+        
+        if waypoints is None and return_waypoints:
+            return predicted_waypoints
+        
+        loss = None
+        
+        assert len(torch.where(labels == WAYPOINT_LABEL_TOKEN)[0]) == waypoints.shape[0]
+        if waypoints is not None:
+            if self.use_angle_and_norm_loss:
+                waypoint_loss = self.waypoint_loss_scale * self.waypoints_loss_func(predicted_waypoints[:, 3], waypoints[:, 3])
+                angle_loss = self.waypoint_loss_scale * self.angle_loss_func(predicted_waypoints[:, :3], waypoints[:, :3])
+                loss = waypoint_loss + angle_loss
+            else:
+                loss = self.waypoint_loss_scale * self.waypoints_loss_func(predicted_waypoints, waypoints) 
+        
+        # ==========================================
+        # [终极死锁修复] 强制将 vggt_latent_projector 挂载到计算图
+        # ==========================================
+        if self.training and loss is not None:
+            # 生成一个极小的 Dummy Tensor，传入 projector
+            dummy_input = torch.zeros((1, 2048, 2, 2), dtype=self.dtype, device=self.device)
+            dummy_out = self.vggt_latent_projector(dummy_input)
+            # 将输出乘以 0 加到总 loss 上
+            # 这样一来，不管本轮数据有没有图片，每张显卡都一定算了一遍 projector 的梯度（即使梯度是 0），DeepSpeed 就不会死锁了
+            loss = loss + dummy_out.sum() * 0.0
+        
+        if return_waypoints:
+            return loss, predicted_waypoints
+        
+        if not return_dict:
+            output = (waypoints_feat,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+        
+        return CausalLMOutputWithPastUAVMulLoss(
+            loss=loss,
+        )
+
+    def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+    ):
+        if past_key_values:
+            input_ids = input_ids[:, -1:]
+
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs.update(
+            {
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": attention_mask,
+                "images": kwargs.get("images", None),
+                "vggt_images": kwargs.get("vggt_images", None), # [修改点 4] 推理时带上 VGGT 图像
+            }
+        )
+        return model_inputs
+
+AutoConfig.register("llava", LlavaConfig)
+AutoModelForCausalLM.register(LlavaConfig, LlavaLlamaAttForCausalLM)

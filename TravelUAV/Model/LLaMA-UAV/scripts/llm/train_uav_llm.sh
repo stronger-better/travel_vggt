@@ -60,4 +60,5 @@ deepspeed \
     --dataloader_num_workers 4 \
     --lazy_preprocess True \
     --report_to wandb \
+    --lora_target_modules "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj" \
     --lora_enable True \

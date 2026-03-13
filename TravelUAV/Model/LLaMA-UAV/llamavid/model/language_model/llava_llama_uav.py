@@ -28,6 +28,7 @@ from llamavid.constants import WAYPOINT_LABEL_TOKEN
 
 from vggt.models.vggt import VGGT
 
+from llamavid.model.multimodal_projector.builder import Evo0FusionLayer
 class LlavaConfig(LlamaConfig):
     model_type = "llava"
 
@@ -96,6 +97,11 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
             nn.AdaptiveAvgPool2d((2, 2)), # 池化到 2x2，每个视角提供 4 个 3D 几何特征 Token
             nn.Conv2d(config.hidden_size, config.hidden_size, kernel_size=1) 
         )
+
+        # ==========================================
+        # [新增] 注册 Evo-0 融合层
+        # ==========================================
+        self.evo_fusion = Evo0FusionLayer(config)
 
         self.waypoints_loss_func = torch.nn.L1Loss()
         self.angle_loss_func = CosineDirectionLoss()
@@ -220,12 +226,13 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
         # [终极死锁修复] 强制将 vggt_latent_projector 挂载到计算图
         # ==========================================
         if self.training and loss is not None:
-            # 生成一个极小的 Dummy Tensor，传入 projector
             dummy_input = torch.zeros((1, 2048, 2, 2), dtype=self.dtype, device=self.device)
             dummy_out = self.vggt_latent_projector(dummy_input)
-            # 将输出乘以 0 加到总 loss 上
-            # 这样一来，不管本轮数据有没有图片，每张显卡都一定算了一遍 projector 的梯度（即使梯度是 0），DeepSpeed 就不会死锁了
-            loss = loss + dummy_out.sum() * 0.0
+            
+            dummy_q = torch.zeros((1, 1, self.config.hidden_size), dtype=self.dtype, device=self.device)
+            dummy_fusion = self.evo_fusion(dummy_q, dummy_out.flatten(2).transpose(1, 2))
+            
+            loss = loss + dummy_fusion.sum() * 0.0
         
         if return_waypoints:
             return loss, predicted_waypoints

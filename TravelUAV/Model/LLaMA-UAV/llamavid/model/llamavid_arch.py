@@ -529,17 +529,17 @@ class LLaMAVIDMetaForCausalLM(ABC):
             
         elif vggt_latent_projector is not None:
             # ==========================================
-            # [关键修复] 防止 DDP 死锁：生成一个带梯度的 0 张量过一遍 Projector
+            # [关键修复] 防止 DDP 死锁：生成 0 张量过一遍 Projector 和 Evo-0 Fusion
             # ==========================================
-            # 假设 B=1, S=1, C=2048, H=16, W=16
             dummy_input = torch.zeros((1, 2048, 16, 16), dtype=self.dtype, device=self.device)
-            # 让 0 张量带上梯度图的勾子
             dummy_input.requires_grad = True 
             dummy_out = vggt_latent_projector(dummy_input)
-            # 计算一个标量的 0 loss 并立即反向传播 (或者直接乘以 0 丢弃)，
-            # 这是为了告诉 DDP: "这张卡也用过 projector 的参数了，别等了"
-            _ = dummy_out.sum() * 0.0
-        # ==========================================
+            
+            dummy_q = torch.zeros((1, 1, self.config.hidden_size), dtype=self.dtype, device=self.device)
+            dummy_q.requires_grad = True
+            dummy_fusion = self.evo_fusion(dummy_q, dummy_out.flatten(2).transpose(1, 2))
+            
+            _ = dummy_fusion.sum() * 0.0
 
         # concat img_feature
         v2 = False
@@ -641,6 +641,22 @@ class LLaMAVIDMetaForCausalLM(ABC):
                     # 将所有视角的 3D Token 展平为一维序列: [S * Tokens_per_view, HiddenSize]
                     vggt_3d_tokens = cur_vggt_3d.reshape(-1, cur_vggt_3d.shape[-1])
 
+
+                # ==========================================
+                # [核心修改: Evo-0 QKV 软融合] 
+                # ==========================================
+                if vggt_3d_tokens is not None:
+                    # 临时增加 Batch 维度: [1, Seq, Hidden]
+                    q_img = current_image_feature.unsqueeze(0)
+                    kv_vggt = vggt_3d_tokens.unsqueeze(0)
+                    
+                    # 用当前 2D 图像做 Query，VGGT 空间特征做 KV
+                    current_image_feature = self.evo_fusion(q_img, kv_vggt).squeeze(0)
+                    # 注意：融合后 current_image_feature 已经被附魔了 3D 空间特征，且 Shape 没变！
+                # ==========================================
+
+
+
                 if history_waypoint_indice is not None and history_image_indice is not None:
                     cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[:history_image_indice])) #old
                     cur_new_input_embeds.append(history_image_feature) #new
@@ -658,16 +674,10 @@ class LLaMAVIDMetaForCausalLM(ABC):
                     cur_new_input_embeds.append(history_image_feature)
                     cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[history_image_indice + 1: current_image_indice]))
                     cur_new_input_embeds.append(current_image_feature)
-                    
-                    if vggt_3d_tokens is not None:
-                        cur_new_input_embeds.append(vggt_3d_tokens) # [新增]
-                        
+                           
                 else:
                     cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[: current_image_indice]))
-                    cur_new_input_embeds.append(current_image_feature)
-                    
-                    if vggt_3d_tokens is not None:
-                        cur_new_input_embeds.append(vggt_3d_tokens) # [新增]
+                    cur_new_input_embeds.append(current_image_feature)    
                     
                 if labels is not None:
                     if history_waypoint_indice is not None and history_image_indice is not None:
@@ -677,27 +687,17 @@ class LLaMAVIDMetaForCausalLM(ABC):
                         cur_new_labels.append(torch.full((history_waypoint_feature.shape[0],), IGNORE_INDEX, device=labels.device, dtype=labels.dtype))
                         cur_new_labels.append(cur_labels[history_waypoint_indice + 1: current_image_indice])
                         cur_new_labels.append(torch.full((current_image_feature.shape[0],), IGNORE_INDEX, device=labels.device, dtype=labels.dtype))
-                        
-                        if vggt_3d_tokens is not None:
-                            # [新增] 在 labels 中用 IGNORE_INDEX 屏蔽 VGGT Token，防止被算作文本交叉熵 Loss
-                            cur_new_labels.append(torch.full((vggt_3d_tokens.shape[0],), IGNORE_INDEX, device=labels.device, dtype=labels.dtype))
                             
                     elif history_image_indice is not None:
                         cur_new_labels.append(cur_labels[:history_image_indice])
                         cur_new_labels.append(torch.full((history_image_feature.shape[0],), IGNORE_INDEX, device=labels.device, dtype=labels.dtype))
                         cur_new_labels.append(cur_labels[history_image_indice + 1: current_image_indice])
                         cur_new_labels.append(torch.full((current_image_feature.shape[0],), IGNORE_INDEX, device=labels.device, dtype=labels.dtype))
-                        
-                        if vggt_3d_tokens is not None:
-                            cur_new_labels.append(torch.full((vggt_3d_tokens.shape[0],), IGNORE_INDEX, device=labels.device, dtype=labels.dtype)) # [新增]
                             
                     else:
                         cur_new_labels.append(cur_labels[: current_image_indice])
                         cur_new_labels.append(torch.full((current_image_feature.shape[0],), IGNORE_INDEX, device=labels.device, dtype=labels.dtype))
-                        
-                        if vggt_3d_tokens is not None:
-                            cur_new_labels.append(torch.full((vggt_3d_tokens.shape[0],), IGNORE_INDEX, device=labels.device, dtype=labels.dtype)) # [新增]
-
+                    
                     cur_labels = cur_labels[current_image_indice + 1:]
 
                 cur_input_ids = cur_input_ids[current_image_indice + 1:]

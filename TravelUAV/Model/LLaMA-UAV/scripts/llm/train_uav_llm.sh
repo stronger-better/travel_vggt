@@ -16,7 +16,7 @@ model_dir=$root_dir/Model/LLaMA-UAV
 # export CUDA_VISIBLE_DEVICES=5
 
 deepspeed \
-    --include localhost:4,5,6,7 \
+    --include localhost:0,1,2,3,4,5,6,7 \
     --master_port 23101 \
     $model_dir/llamavid/train/train_uav/train_uav_notice.py \
     --data_path $root_dir/data/uav_dataset/trainset.json \

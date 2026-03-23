@@ -31,10 +31,18 @@ class TravelModelWrapper(BaseModelWrapper):
             rot_to_targets.append(rot_to_target)
         batch = inputs_to_batch(tokenizer=self.tokenizer, instances=inputs)
 
+        # 1. [修改] 在第一层的过滤字典中，加上 'vggt_images not in k' 排除它，防止被错误转换
         inputs_device = {k: v.to(self.model.device) for k, v in batch.items() 
-            if 'prompts' not in k and 'images' not in k and 'historys' not in k}
+            if 'prompts' not in k and 'images' not in k and 'historys' not in k and 'vggt_images' not in k}
+        
         inputs_device['prompts'] = [item for item in batch['prompts']]
         inputs_device['images'] = [item.to(self.model.device) for item in batch['images']]
+        # 2. ==========================================
+        # [新增] 将 vggt_images 放到模型所在设备，并强制对齐 dtype
+        # ==========================================
+        if 'vggt_images' in batch:
+            inputs_device['vggt_images'] = batch['vggt_images'].to(device=self.model.device, dtype=self.model.dtype)
+        # ==========================================
         inputs_device['historys'] = [item.to(device=self.model.device, dtype=self.model.dtype) for item in batch['historys']]
         inputs_device['orientations'] = inputs_device['orientations'].to(dtype=self.model.dtype)
         inputs_device['return_waypoints'] = True

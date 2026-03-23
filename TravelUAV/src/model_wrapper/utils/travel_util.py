@@ -249,7 +249,16 @@ def prepare_data_to_inputs(episodes, tokenizer, image_processor, data_args, targ
             break
     images = np.stack(images, axis=0)
     image = processor.preprocess(images, return_tensors='pt')['pixel_values']
-    
+
+    # ==========================================
+    # [新增] 构建用于 VGGT 的 vggt_image (与训练严格对齐)
+    # ==========================================
+    # 使用 CLIP 的均值和方差进行反归一化，将像素值限制在 [0, 1]
+    CLIP_MEAN = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1).to(image.device)
+    CLIP_STD = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1).to(image.device)
+    vggt_image = torch.clamp(image * CLIP_STD + CLIP_MEAN, 0.0, 1.0)
+    # ==========================================
+
     conversation_for_human = '<image>\n' + sources[-1]['instruction']
     conversation = [
     {
@@ -340,6 +349,13 @@ def inputs_to_batch(tokenizer, instances: Sequence[Dict]) -> Dict[str, torch.Ten
                 batch['images'] = torch.stack(images)
             else:
                 batch['images'] = images
+
+        # ==========================================
+        # [新增] 堆叠 vggt_images 到 5D 张量 [B, S, C, H, W]
+        # ==========================================
+        if 'vggt_image' in instances[0]:
+            batch['vggt_images'] = torch.stack([instance['vggt_image'] for instance in instances], dim=0)
+        # ==========================================
 
         if 'prompt' in instances[0]:
             batch['prompts'] = [instance['prompt'] for instance in instances]

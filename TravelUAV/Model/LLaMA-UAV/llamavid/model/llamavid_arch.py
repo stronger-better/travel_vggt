@@ -516,7 +516,13 @@ class LLaMAVIDMetaForCausalLM(ABC):
 
         if vggt_images is not None and vggt_model is not None and vggt_latent_projector is not None:
             with torch.no_grad():
-                vggt_outputs = vggt_model(vggt_images)
+                # 【关键防护】将 5D 张量展平为 4D
+                if vggt_images.dim() == 5:
+                    B_v, S_v, C_v, H_v, W_v = vggt_images.shape
+                    vggt_images_input = vggt_images.view(B_v * S_v, C_v, H_v, W_v)
+                else:
+                    vggt_images_input = vggt_images
+                vggt_outputs = self.vggt_model(vggt_images_input.to(torch.float32))
                 latent_tokens = vggt_outputs['latent_tokens'].to(self.dtype)
                 
             B, S, N, C = latent_tokens.shape

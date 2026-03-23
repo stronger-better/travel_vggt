@@ -664,9 +664,6 @@ class LLaMAVIDMetaForCausalLM(ABC):
                     cur_new_input_embeds.append(history_waypoint_feature)
                     cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[history_waypoint_indice + 1: current_image_indice]))
                     cur_new_input_embeds.append(current_image_feature)
-                    
-                    if vggt_3d_tokens is not None:
-                        cur_new_input_embeds.append(vggt_3d_tokens) # [新增] 将 VGGT Token 紧跟在 2D 图像后
                         
                 elif history_image_indice is not None:
                     print("History image indice is not None")

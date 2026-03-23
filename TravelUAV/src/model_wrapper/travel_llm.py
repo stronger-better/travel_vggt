@@ -35,6 +35,12 @@ class TravelModelWrapper(BaseModelWrapper):
             if 'prompts' not in k and 'images' not in k and 'historys' not in k}
         inputs_device['prompts'] = [item for item in batch['prompts']]
         inputs_device['images'] = [item.to(self.model.device) for item in batch['images']]
+        # ==========================================
+        # [新增] 放置 VGGT 图像并对齐精度 (bf16/fp16)
+        # ==========================================
+        if 'vggt_images' in batch:
+            inputs_device['vggt_images'] = batch['vggt_images'].to(device=self.model.device, dtype=self.model.dtype)
+        # ==========================================
         inputs_device['historys'] = [item.to(device=self.model.device, dtype=self.model.dtype) for item in batch['historys']]
         inputs_device['orientations'] = inputs_device['orientations'].to(dtype=self.model.dtype)
         inputs_device['return_waypoints'] = True

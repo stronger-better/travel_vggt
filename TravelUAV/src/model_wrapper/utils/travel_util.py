@@ -250,6 +250,15 @@ def prepare_data_to_inputs(episodes, tokenizer, image_processor, data_args, targ
     images = np.stack(images, axis=0)
     image = processor.preprocess(images, return_tensors='pt')['pixel_values']
     
+    # ==========================================
+    # [新增] 构建用于 VGGT 和 Evo0 Fusion 的 vggt_image
+    # ==========================================
+    CLIP_MEAN = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1).to(image.device)
+    CLIP_STD = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1).to(image.device)
+    vggt_image = torch.clamp(image * CLIP_STD + CLIP_MEAN, 0.0, 1.0)
+    # ==========================================
+
+
     conversation_for_human = '<image>\n' + sources[-1]['instruction']
     conversation = [
     {
@@ -304,6 +313,7 @@ def prepare_data_to_inputs(episodes, tokenizer, image_processor, data_args, targ
                         labels=data_dict["labels"][0])
 
     data_dict['image'] = image
+    data_dict['vggt_image'] = vggt_image # <-- [新增] 将其塞入字典
     data_dict['history_waypoint'] = torch.tensor(history_waypoint).view(-1)
     ori_0 = ori_sources[0]['sensors']['state']
     ori = ori_sources[-1]['sensors']['state']
@@ -340,6 +350,13 @@ def inputs_to_batch(tokenizer, instances: Sequence[Dict]) -> Dict[str, torch.Ten
                 batch['images'] = torch.stack(images)
             else:
                 batch['images'] = images
+
+        # ==========================================
+        # [新增] 堆叠 vggt_images
+        # ==========================================
+        if 'vggt_image' in instances[0]:
+            batch['vggt_images'] = torch.stack([instance['vggt_image'] for instance in instances], dim=0)
+        # ==========================================
 
         if 'prompt' in instances[0]:
             batch['prompts'] = [instance['prompt'] for instance in instances]

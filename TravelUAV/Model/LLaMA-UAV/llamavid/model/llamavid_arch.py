@@ -570,6 +570,19 @@ class LLaMAVIDMetaForCausalLM(ABC):
                 
                 current_image_features.append(current_image_feature.view(1, -1, current_image_feature.shape[-1]))
                 history_waypoint_features.append(historys[i].view(1, -1, current_image_feature.shape[-1]))
+
+            if vggt_images is not None and hasattr(self, "fuse_current_image_features_with_geometry"):
+                fused_current_image_features = []
+                for i, current_image_feature in enumerate(current_image_features):
+                    sample_vggt_images = None
+                    if isinstance(vggt_images, torch.Tensor):
+                        sample_vggt_images = vggt_images[i]
+                    fused_feature = self.fuse_current_image_features_with_geometry(
+                        current_image_feature[0],
+                        sample_vggt_images,
+                    )
+                    fused_current_image_features.append(fused_feature.unsqueeze(0))
+                current_image_features = fused_current_image_features
                 
         elif v2:
             for i in range(len(image_features)):

@@ -313,6 +313,7 @@ def prepare_data_to_inputs(episodes, tokenizer, image_processor, data_args, targ
                         labels=data_dict["labels"][0])
 
     data_dict['image'] = image
+    data_dict['vggt_image'] = vggt_image
     data_dict['history_waypoint'] = torch.tensor(history_waypoint).view(-1)
     ori_0 = ori_sources[0]['sensors']['state']
     ori = ori_sources[-1]['sensors']['state']

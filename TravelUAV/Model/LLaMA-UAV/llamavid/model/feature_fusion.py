@@ -45,8 +45,11 @@ class VGGTGeometryEncoder(nn.Module):
         if images.dim() == 3:
             images = images.unsqueeze(0)
 
+        param = next(self.vggt.parameters())
+        images = images.to(device=param.device, dtype=param.dtype)
+
         with torch.no_grad():
-            aggregated_tokens_list, patch_start_idx = self.vggt.aggregator(images[None].to(torch.float32))
+            aggregated_tokens_list, patch_start_idx = self.vggt.aggregator(images[None])
             features = aggregated_tokens_list[-2][0, :, patch_start_idx:]
         return features
 

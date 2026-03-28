@@ -29,6 +29,8 @@ from llamavid.constants import WAYPOINT_LABEL_TOKEN
 from vggt.models.vggt import VGGT
 
 from llamavid.model.multimodal_projector.builder import Evo0FusionLayer
+
+
 class LlavaConfig(LlamaConfig):
     model_type = "llava"
 
@@ -159,7 +161,7 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
                 input_ids = input_ids.to(device=self.device)
             if attention_mask.device != self.device:
                 attention_mask = attention_mask.to(device=self.device)
-            if labels.device != self.device:
+            if labels is not None and labels.device != self.device:
                 labels = labels.to(device=self.device)
             
             # [修改点 1] 移动 device 的逻辑补齐
@@ -172,9 +174,9 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
         else:
             images = [image.to(dtype=self.dtype) for image in images]
             
-        # [修改点 2] 补全 vggt_images 的数据精度转换 (半精度 fp16/bf16 对齐)
+        # [修改点 2] vggt_images 保持 fp32，避免 VGGT 分支在半精度下失稳
         if vggt_images is not None:
-            vggt_images = vggt_images.to(dtype=self.dtype)
+            vggt_images = vggt_images.to(device=self.device, dtype=torch.float32)
         
         history_embeds = []
         
@@ -190,8 +192,9 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
             prompts=prompts, historys=history_embeds, special_token_dict=self.special_token_dict,
             vggt_images=vggt_images 
         )
-        
         inputs_embeds = inputs_embeds.to(dtype=self.waypoint_emb.weight.dtype)
+        if not torch.isfinite(inputs_embeds).all():
+            inputs_embeds = torch.nan_to_num(inputs_embeds, nan=0.0, posinf=0.0, neginf=0.0)
         inputs_embeds[labels == WAYPOINT_LABEL_TOKEN] = self.waypoint_emb.weight
         
         outputs = self.model(

@@ -59,6 +59,28 @@ def rank0_print(*args):
     if local_rank == 0:
         print(*args)
 
+def set_module_requires_grad(module, requires_grad: bool):
+    if module is None:
+        return
+    for param in module.parameters():
+        param.requires_grad = requires_grad
+
+def resolve_model_module(model, module_name: str):
+    if hasattr(model, module_name):
+        return getattr(model, module_name)
+    if hasattr(model, "get_model"):
+        core_model = model.get_model()
+        if hasattr(core_model, module_name):
+            return getattr(core_model, module_name)
+    base_model = getattr(model, "base_model", None)
+    if base_model is not None:
+        if hasattr(base_model, module_name):
+            return getattr(base_model, module_name)
+        wrapped_model = getattr(base_model, "model", None)
+        if wrapped_model is not None and hasattr(wrapped_model, module_name):
+            return getattr(wrapped_model, module_name)
+    return None
+
 def rotation_matrix_from_vector(x, y):
     v_x = np.array([x, y, 0])
     v_x = v_x / np.linalg.norm(v_x)
@@ -86,6 +108,8 @@ class ModelArguments:
     freeze_backbone: bool = field(default=False)
     tune_mm_mlp_adapter: bool = field(default=False)
     tune_waypoint_predictor: bool = field(default=True)
+    tune_evo_fusion: bool = field(default=True)
+    tune_vggt_latent_projector: bool = field(default=True)
     vision_tower: Optional[str] = field(default=None)
     image_processor: Optional[str] = field(default=None)
     mm_vision_select_layer: Optional[int] = field(default=-1)   # default to the last layer
@@ -207,12 +231,13 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
     to_return = {k: maybe_zero_3(v, ignore_status=True).cpu() for k, v in to_return.items()}
     return to_return
 
+
 def find_all_linear_names(model):
     cls = torch.nn.Linear
     lora_module_names = set()
     # multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler', 'vlm_att']
     multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler', 'vlm_att', 'waypoint_emb', 'waypoints_fc', 'waypoints_predictor',
-                         'waypoints_output', 'history_predictor', 'history_preprocessor', 'is_help_predictor'] # end_predictor
+                         'waypoints_output', 'history_predictor', 'history_preprocessor', 'is_help_predictor', 'evo_fusion', 'vggt_latent_projector'] # end_predictor
     
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
@@ -234,7 +259,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
         # Only save Adapter
         # keys_to_match = ['mm_projector']
         keys_to_match = ['mm_projector', 'vision_resampler', 'vlm_att', 'waypoint_emb', 'waypoints_fc', 'waypoints_predictor',
-                         'waypoints_output', 'history_predictor', 'history_preprocessor', 'is_help_predictor', 'embed_tokens'] # 'end_predictor',
+                         'waypoints_output', 'history_predictor', 'history_preprocessor', 'is_help_predictor', 'evo_fusion', 'vggt_latent_projector', 'embed_tokens'] # 'end_predictor',
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(['embed_tokens', 'embed_in'])
 
@@ -1141,7 +1166,6 @@ def train():
             r=training_args.lora_r,
             lora_alpha=training_args.lora_alpha,
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-            layers_to_transform=[i for i in range(0, 32)], 
             lora_dropout=training_args.lora_dropout,
             bias=training_args.lora_bias,
             task_type="CAUSAL_LM",
@@ -1205,13 +1229,20 @@ def train():
         model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
         if model_args.tune_mm_mlp_adapter:
             model.requires_grad_(False)
-            for p in model.get_model().mm_projector.parameters():
-                p.requires_grad = True
+            set_module_requires_grad(model.get_model().mm_projector, True)
+            set_module_requires_grad(resolve_model_module(model, "evo_fusion"), model_args.tune_evo_fusion)
+            set_module_requires_grad(
+                resolve_model_module(model, "vggt_latent_projector"),
+                model_args.tune_vggt_latent_projector,
+            )
+            rank0_print(
+                f"Train module flags | mm_projector=True, evo_fusion={model_args.tune_evo_fusion}, "
+                f"vggt_latent_projector={model_args.tune_vggt_latent_projector}"
+            )
 
         model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
         if training_args.freeze_mm_mlp_adapter:
-            for p in model.get_model().mm_projector.parameters():
-                p.requires_grad = False
+            set_module_requires_grad(model.get_model().mm_projector, False)
 
         if training_args.bits in [4, 8]:
             model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)

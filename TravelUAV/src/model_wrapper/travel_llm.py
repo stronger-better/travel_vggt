@@ -9,10 +9,27 @@ class TravelModelWrapper(BaseModelWrapper):
         self.tokenizer, self.model, self.image_processor = load_model(model_args)
         self.traj_model = load_traj_model(model_args)
         self.model.to(torch.bfloat16)
+        self._force_vggt_fp32()
         self.traj_model.to(dtype=torch.bfloat16, device=self.model.device)
         self.dino_moinitor = None
         self.model_args = model_args
         self.data_args = data_args
+
+    def _force_vggt_fp32(self):
+        candidate_modules = []
+        if hasattr(self.model, "vggt_model"):
+            candidate_modules.append(self.model.vggt_model)
+        base_model = getattr(self.model, "base_model", None)
+        if base_model is not None and hasattr(base_model, "model") and hasattr(base_model.model, "vggt_model"):
+            candidate_modules.append(base_model.model.vggt_model)
+
+        visited = set()
+        for module in candidate_modules:
+            if module is None or id(module) in visited:
+                continue
+            module.to(device=self.model.device, dtype=torch.float32)
+            module.eval()
+            visited.add(id(module))
 
     def prepare_inputs(self, episodes, target_positions, assist_notices=None):
         inputs = []
@@ -39,7 +56,7 @@ class TravelModelWrapper(BaseModelWrapper):
         # [新增] 放置 VGGT 图像并对齐精度 (bf16/fp16)
         # ==========================================
         if 'vggt_images' in batch:
-            inputs_device['vggt_images'] = batch['vggt_images'].to(device=self.model.device, dtype=self.model.dtype)
+            inputs_device['vggt_images'] = batch['vggt_images'].to(device=self.model.device, dtype=torch.float32)
         # ==========================================
         inputs_device['historys'] = [item.to(device=self.model.device, dtype=self.model.dtype) for item in batch['historys']]
         inputs_device['orientations'] = inputs_device['orientations'].to(dtype=self.model.dtype)
@@ -50,9 +67,16 @@ class TravelModelWrapper(BaseModelWrapper):
 
     def run_llm_model(self, inputs):
         waypoints_llm = self.model(**inputs).cpu().to(dtype=torch.float32).numpy()
+        waypoints_llm = np.nan_to_num(waypoints_llm, nan=0.0, posinf=0.0, neginf=0.0)
         waypoints_llm_new = []
         for waypoint in waypoints_llm:
-            waypoint_new = waypoint[:3] / (1e-6 + np.linalg.norm(waypoint[:3])) * waypoint[3]
+            direction = waypoint[:3]
+            direction_norm = np.linalg.norm(direction)
+            if direction_norm < 1e-6:
+                direction = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+                direction_norm = 1.0
+            distance = float(np.clip(waypoint[3], 0.0, 30.0))
+            waypoint_new = direction / (1e-6 + direction_norm) * distance
             waypoints_llm_new.append(waypoint_new)
         return np.array(waypoints_llm_new)
 
@@ -70,6 +94,24 @@ class TravelModelWrapper(BaseModelWrapper):
     def run(self, inputs, episodes, rot_to_targets):
         waypoints_llm_new = self.run_llm_model(inputs)
         refined_waypoints = self.run_traj_model(episodes, waypoints_llm_new, rot_to_targets)
+        fixed_refined_waypoints = []
+        invalid_traj_count = 0
+        for i in range(len(refined_waypoints)):
+            traj = np.asarray(refined_waypoints[i], dtype=np.float32)
+            if traj.ndim != 2 or traj.shape[1] != 3 or (not np.isfinite(traj).all()):
+                invalid_traj_count += 1
+                ep = episodes[i]
+                state = ep[-1]["sensors"]["state"]
+                pos = np.asarray(state["position"], dtype=np.float32)
+                rot = np.asarray(ep[-1]["sensors"]["imu"]["rotation"], dtype=np.float32)
+                if rot.shape == (3, 3):
+                    forward = rot[:, 0]
+                else:
+                    forward = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+                forward = forward / (np.linalg.norm(forward) + 1e-6)
+                traj = np.stack([pos + forward * float(step + 1) for step in range(7)], axis=0)
+            fixed_refined_waypoints.append(traj)
+        refined_waypoints = fixed_refined_waypoints
         return refined_waypoints
     
     def predict_done(self, episodes, object_infos):

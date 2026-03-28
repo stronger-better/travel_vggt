@@ -102,4 +102,3 @@ class VisionTrajectoryGenerator(nn.Module):
         loss = self.waypoints_loss_func(label, pred_trajectory_points)
         
         return loss, pred_trajectory_points
-

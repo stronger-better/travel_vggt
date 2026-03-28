@@ -17,6 +17,7 @@
 # ------------------------------------------------------------------------
 
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 import os
 import json
 import numpy as np
@@ -516,28 +517,52 @@ class LLaMAVIDMetaForCausalLM(ABC):
 
         if vggt_images is not None and vggt_model is not None and vggt_latent_projector is not None:
             with torch.no_grad():
-                vggt_outputs = vggt_model(vggt_images)
-                latent_tokens = vggt_outputs['latent_tokens'].to(self.dtype)
-                
-            B, S, N, C = latent_tokens.shape
-            Grid_Size = int(N ** 0.5) 
-            
-            latent_grid = latent_tokens.view(B*S, Grid_Size, Grid_Size, C).permute(0, 3, 1, 2).contiguous()
-            proj_out = vggt_latent_projector(latent_grid)
-            proj_out = proj_out.flatten(2).transpose(1, 2)
-            vggt_3d_tokens_list = proj_out.view(B, S, -1, proj_out.shape[-1])
+                vggt_model = vggt_model.to(device=self.device, dtype=torch.float32)
+                vggt_model.eval()
+                vggt_inputs = vggt_images.to(device=self.device, dtype=torch.float32)
+
+                if vggt_inputs.device.type in ("cuda", "cpu"):
+                    autocast_ctx = torch.autocast(device_type=vggt_inputs.device.type, enabled=False)
+                else:
+                    autocast_ctx = nullcontext()
+
+                with autocast_ctx:
+                    vggt_outputs = vggt_model(vggt_inputs)
+                latent_tokens = vggt_outputs['latent_tokens'].to(dtype=torch.float32)
+
+            if torch.isfinite(latent_tokens).all():
+                B, S, N, C = latent_tokens.shape
+                grid_size = int(N ** 0.5)
+                latent_grid = latent_tokens.view(B * S, grid_size, grid_size, C).permute(0, 3, 1, 2).contiguous()
+                proj_param = next(vggt_latent_projector.parameters(), None)
+                proj_dtype = proj_param.dtype if proj_param is not None else self.dtype
+                proj_device = proj_param.device if proj_param is not None else self.device
+                latent_grid = latent_grid.to(device=proj_device, dtype=proj_dtype)
+                proj_out = vggt_latent_projector(latent_grid)
+                if torch.isfinite(proj_out).all():
+                    proj_out = proj_out.flatten(2).transpose(1, 2)
+                    vggt_3d_tokens_list = proj_out.view(B, S, -1, proj_out.shape[-1])
+                    if not torch.isfinite(vggt_3d_tokens_list).all():
+                        vggt_3d_tokens_list = None
             
         elif vggt_latent_projector is not None:
             # ==========================================
             # [关键修复] 防止 DDP 死锁：生成 0 张量过一遍 Projector 和 Evo-0 Fusion
             # ==========================================
-            dummy_input = torch.zeros((1, 2048, 16, 16), dtype=self.dtype, device=self.device)
+            proj_param = next(vggt_latent_projector.parameters(), None)
+            proj_dtype = proj_param.dtype if proj_param is not None else self.dtype
+            proj_device = proj_param.device if proj_param is not None else self.device
+            dummy_input = torch.zeros((1, 2048, 16, 16), dtype=proj_dtype, device=proj_device)
             dummy_input.requires_grad = True 
             dummy_out = vggt_latent_projector(dummy_input)
             
-            dummy_q = torch.zeros((1, 1, self.config.hidden_size), dtype=self.dtype, device=self.device)
+            evo_param = next(self.evo_fusion.parameters(), None)
+            evo_dtype = evo_param.dtype if evo_param is not None else dummy_out.dtype
+            evo_device = evo_param.device if evo_param is not None else dummy_out.device
+            dummy_q = torch.zeros((1, 1, self.config.hidden_size), dtype=evo_dtype, device=evo_device)
             dummy_q.requires_grad = True
-            dummy_fusion = self.evo_fusion(dummy_q, dummy_out.flatten(2).transpose(1, 2))
+            dummy_kv = dummy_out.flatten(2).transpose(1, 2).to(device=evo_device, dtype=evo_dtype)
+            dummy_fusion = self.evo_fusion(dummy_q, dummy_kv)
             
             _ = dummy_fusion.sum() * 0.0
 
@@ -648,10 +673,13 @@ class LLaMAVIDMetaForCausalLM(ABC):
                 if vggt_3d_tokens is not None:
                     # 临时增加 Batch 维度: [1, Seq, Hidden]
                     q_img = current_image_feature.unsqueeze(0)
-                    kv_vggt = vggt_3d_tokens.unsqueeze(0)
+                    kv_vggt = vggt_3d_tokens.to(device=q_img.device, dtype=q_img.dtype).unsqueeze(0)
                     
                     # 用当前 2D 图像做 Query，VGGT 空间特征做 KV
-                    current_image_feature = self.evo_fusion(q_img, kv_vggt).squeeze(0)
+                    if torch.isfinite(q_img).all() and torch.isfinite(kv_vggt).all():
+                        fused_feature = self.evo_fusion(q_img, kv_vggt)
+                        if torch.isfinite(fused_feature).all():
+                            current_image_feature = fused_feature.squeeze(0)
                     # 注意：融合后 current_image_feature 已经被附魔了 3D 空间特征，且 Shape 没变！
                 # ==========================================
 
@@ -666,7 +694,6 @@ class LLaMAVIDMetaForCausalLM(ABC):
                     cur_new_input_embeds.append(current_image_feature)
                         
                 elif history_image_indice is not None:
-                    print("History image indice is not None")
                     cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[:history_image_indice]))
                     cur_new_input_embeds.append(history_image_feature)
                     cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[history_image_indice + 1: current_image_indice]))

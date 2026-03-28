@@ -230,7 +230,6 @@ if is_torch_tpu_available(check_device=False):
     import torch_xla.debug.metrics as met
     
 class LLaVATrainer(Trainer):
-    
     def _inner_training_loop(
         self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
     ):
@@ -898,7 +897,9 @@ class LLaVATrainer(Trainer):
             output_dir = os.path.join(run_dir, checkpoint_folder)
 
             # 获取仅包含 mm_projector 的权重
-            keys_to_match = ['mm_projector', 'vision_resampler']
+            keys_to_match = ['mm_projector', 'vision_resampler', 'vlm_att', 'waypoint_emb', 'waypoints_fc',
+                             'waypoints_predictor', 'waypoints_output', 'history_predictor',
+                             'history_preprocessor', 'is_help_predictor', 'evo_fusion', 'vggt_latent_projector']
             if getattr(self.args, "use_im_start_end", False):
                 keys_to_match.extend(['embed_tokens', 'embed_in'])
 
@@ -919,7 +920,9 @@ class LLaVATrainer(Trainer):
         # [修改 2] 额外把 mm_projector 单独抽出来存一份，方便以后你只拿 projector 去做推理
         # ==========================================
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
-            keys_to_match = ['mm_projector', 'vision_resampler']
+            keys_to_match = ['mm_projector', 'vision_resampler', 'vlm_att', 'waypoint_emb', 'waypoints_fc',
+                             'waypoints_predictor', 'waypoints_output', 'history_predictor',
+                             'history_preprocessor', 'is_help_predictor', 'evo_fusion', 'vggt_latent_projector']
             if getattr(self.args, "use_im_start_end", False):
                 keys_to_match.extend(['embed_tokens', 'embed_in'])
 

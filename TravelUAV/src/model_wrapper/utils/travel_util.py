@@ -18,11 +18,13 @@ from llamavid.model.builder import load_pretrained_model
 from llamavid.model.vis_traj_arch import VisionTrajectoryGenerator
 from peft import PeftModel
 from llava.mm_utils import tokenizer_image_token, get_model_name_from_path
+from utils.logger import logger
 from llamavid.constants import (
     IGNORE_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN,
     WAYPOINT_INPUT_TOKEN, WAYPOINT_LABEL_TOKEN, DEFAULT_HISTORY_TOKEN, DEFAULT_WP_TOKEN
 )
 from llamavid import conversation as conversation_lib
+
 def load_model(args):
     model_path = os.path.expanduser(args.model_path)
     model_name = get_model_name_from_path(model_path)
@@ -35,10 +37,44 @@ def load_model(args):
     if lora_enable:
         print(f"Loading LoRA weights from {model_path}")
         model = PeftModel.from_pretrained(model, model_path)
-        non_lora_weights = torch.load(os.path.join(model_path, 'non_lora_trainables.bin'), map_location='cpu')
-        model.load_state_dict(non_lora_weights, strict=False)    
-        mm_projector_weights = torch.load(os.path.join(model_path, 'mm_projector.bin'), map_location='cpu')
-        model.load_state_dict(mm_projector_weights, strict=False)
+
+        model_dir_name = os.path.basename(os.path.normpath(model_path))
+        non_lora_path = os.path.join(model_path, 'non_lora_trainables.bin')
+        if (not os.path.exists(non_lora_path)) and model_dir_name.startswith("checkpoint-"):
+            non_lora_path = os.path.join(os.path.dirname(model_path), 'non_lora_trainables.bin')
+        mm_projector_path = os.path.join(model_path, 'mm_projector.bin')
+        if (not os.path.exists(mm_projector_path)) and model_dir_name.startswith("checkpoint-"):
+            mm_projector_path = os.path.join(os.path.dirname(model_path), 'mm_projector', f'{model_dir_name}.bin')
+
+        non_lora_weights = {}
+        if os.path.exists(non_lora_path):
+            non_lora_weights = torch.load(non_lora_path, map_location='cpu')
+            model.load_state_dict(non_lora_weights, strict=False)
+        else:
+            logger.warning("Missing non_lora_trainables.bin: %s", non_lora_path)
+
+        mm_projector_weights = {}
+        if os.path.exists(mm_projector_path):
+            mm_projector_weights = torch.load(mm_projector_path, map_location='cpu')
+            model.load_state_dict(mm_projector_weights, strict=False)
+        else:
+            logger.warning("Missing mm_projector.bin: %s", mm_projector_path)
+
+        def _has_module_prefix(state_dict, prefix):
+            if not state_dict:
+                return False
+            for key in state_dict.keys():
+                if key == prefix or key.startswith(prefix + ".") or f".{prefix}." in key:
+                    return True
+            return False
+
+        required_modules = ("evo_fusion", "vggt_latent_projector")
+        missing_required = []
+        for module_prefix in required_modules:
+            if (not _has_module_prefix(non_lora_weights, module_prefix)) and (not _has_module_prefix(mm_projector_weights, module_prefix)):
+                missing_required.append(module_prefix)
+        if missing_required:
+            logger.warning("Checkpoint missing expected modules: %s", ",".join(missing_required))
     
     return tokenizer, model, image_processor
 

@@ -99,6 +99,11 @@ class ModelArguments:
     pretrain_qformer: Optional[str] = field(default=None)
     compress_type: Optional[str] = field(default=None)
     use_angle_and_norm_loss: bool = field(default=True)
+    feature_fusion_method: Optional[str] = field(default="gated")
+    fusion_attention_heads: Optional[int] = field(default=8)
+    fusion_num_layers: Optional[int] = field(default=1)
+    fusion_dropout: Optional[float] = field(default=0.1)
+    geometry_merge_size: Optional[int] = field(default=4)
 
 
 @dataclass
@@ -212,7 +217,8 @@ def find_all_linear_names(model):
     lora_module_names = set()
     # multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler', 'vlm_att']
     multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler', 'vlm_att', 'waypoint_emb', 'waypoints_fc', 'waypoints_predictor',
-                         'waypoints_output', 'history_predictor', 'history_preprocessor', 'is_help_predictor'] # end_predictor
+                         'waypoints_output', 'history_predictor', 'history_preprocessor', 'is_help_predictor',
+                         'geometry_encoder', 'geometry_merger', 'feature_fusion'] # end_predictor
     
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
@@ -234,7 +240,8 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
         # Only save Adapter
         # keys_to_match = ['mm_projector']
         keys_to_match = ['mm_projector', 'vision_resampler', 'vlm_att', 'waypoint_emb', 'waypoints_fc', 'waypoints_predictor',
-                         'waypoints_output', 'history_predictor', 'history_preprocessor', 'is_help_predictor', 'embed_tokens'] # 'end_predictor',
+                         'waypoints_output', 'history_predictor', 'history_preprocessor', 'is_help_predictor',
+                         'geometry_merger', 'feature_fusion', 'embed_tokens'] # 'end_predictor',
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(['embed_tokens', 'embed_in'])
 
@@ -1113,6 +1120,11 @@ def train():
     model = LlavaLlamaAttForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         use_angle_and_norm_loss=model_args.use_angle_and_norm_loss,
+        feature_fusion_method=model_args.feature_fusion_method,
+        fusion_attention_heads=model_args.fusion_attention_heads,
+        fusion_num_layers=model_args.fusion_num_layers,
+        fusion_dropout=model_args.fusion_dropout,
+        geometry_merge_size=model_args.geometry_merge_size,
         config=config,
         cache_dir=training_args.cache_dir,
         **bnb_model_from_pretrained_args
@@ -1207,6 +1219,12 @@ def train():
             model.requires_grad_(False)
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = True
+            if hasattr(model, "geometry_merger"):
+                for p in model.geometry_merger.parameters():
+                    p.requires_grad = True
+            if hasattr(model, "feature_fusion"):
+                for p in model.feature_fusion.parameters():
+                    p.requires_grad = True
 
         model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
         if training_args.freeze_mm_mlp_adapter:

@@ -84,12 +84,15 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
         fusion_heads = model_args.get("fusion_attention_heads", max(1, config.num_attention_heads // 4))
         fusion_layers = model_args.get("fusion_num_layers", 1)
         fusion_dropout = model_args.get("fusion_dropout", 0.1)
+        self.geometry_merge_size = int(model_args.get("geometry_merge_size", 4))
 
         self.geometry_encoder = VGGTGeometryEncoder()
         self.geometry_merger = GeometryFeatureMerger(
-            input_dim=self.geometry_encoder.feature_dim,
             output_dim=config.hidden_size,
             hidden_dim=config.hidden_size,
+            context_dim=self.geometry_encoder.feature_dim,
+            spatial_merge_size=self.geometry_merge_size,
+            merger_type="mlp",
         )
         self.feature_fusion = FeatureFusionModule(
             FeatureFusionConfig(
@@ -116,6 +119,18 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
     def get_model(self):
         return self.model
 
+    @staticmethod
+    def _infer_image_token_layout(total_tokens: int):
+        side_no_ctx = int(total_tokens ** 0.5)
+        if side_no_ctx * side_no_ctx == total_tokens:
+            return side_no_ctx, False
+
+        side_with_ctx = int((total_tokens - 1) ** 0.5)
+        if total_tokens > 1 and side_with_ctx * side_with_ctx == (total_tokens - 1):
+            return side_with_ctx, True
+
+        return None, None
+
     def fuse_current_image_features_with_geometry(self, current_image_feature, sample_vggt_images):
         if sample_vggt_images is None:
             return current_image_feature
@@ -126,12 +141,45 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
         if sample_vggt_images.shape[0] == 0 or current_image_feature.shape[0] == 0:
             return current_image_feature
 
+        n_image = sample_vggt_images.shape[0]
+        total_tokens = current_image_feature.shape[0]
+        if total_tokens % n_image != 0:
+            return current_image_feature
+
+        token_per_image = total_tokens // n_image
+        vis_side, has_ctx = self._infer_image_token_layout(token_per_image)
+        if vis_side is None:
+            return current_image_feature
+
+        image_tokens = current_image_feature.reshape(n_image, token_per_image, -1)
+        if has_ctx:
+            ctx_tokens = image_tokens[:, :1, :]
+            vis_tokens = image_tokens[:, 1:, :]
+        else:
+            ctx_tokens = None
+            vis_tokens = image_tokens
+
         geometry_tokens = self.geometry_encoder.encode(sample_vggt_images)
         geometry_tokens = geometry_tokens.to(device=current_image_feature.device, dtype=current_image_feature.dtype)
-        geometry_tokens = geometry_tokens.reshape(1, -1, geometry_tokens.shape[-1])
-        geometry_tokens = self.geometry_merger(geometry_tokens, current_image_feature.shape[0])
-        fused = self.feature_fusion(current_image_feature.unsqueeze(0), geometry_tokens)
-        return fused.squeeze(0)
+        geo_token_num = geometry_tokens.shape[1]
+        geo_side = int(geo_token_num ** 0.5)
+        if geo_side * geo_side != geo_token_num:
+            return current_image_feature
+
+        geometry_grid = geometry_tokens.reshape(n_image, geo_side, geo_side, -1)
+        if geo_side // vis_side != self.geometry_merge_size:
+            return current_image_feature
+
+        merged_geometry = self.geometry_merger(geometry_grid, target_hw=(vis_side, vis_side))
+        vis_grid = vis_tokens.reshape(n_image, vis_side, vis_side, -1)
+        fused_vis_grid = self.feature_fusion(vis_grid, merged_geometry)
+        fused_vis_tokens = fused_vis_grid.reshape(n_image, vis_side * vis_side, -1)
+
+        if has_ctx:
+            fused_tokens = torch.cat([ctx_tokens, fused_vis_tokens], dim=1)
+        else:
+            fused_tokens = fused_vis_tokens
+        return fused_tokens.reshape(total_tokens, -1)
 
     def forward_waypoint(self, hidden_states):
         _, hidden_size = hidden_states.size()

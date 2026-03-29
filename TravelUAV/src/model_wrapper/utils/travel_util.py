@@ -25,6 +25,17 @@ from llamavid.constants import (
 )
 from llamavid import conversation as conversation_lib
 
+WAYPOINT_FLOW_DEBUG = os.environ.get("TRAVEL_WAYPOINT_FLOW_DEBUG", "0") == "1"
+
+
+def _safe_norm(vec, eps=1e-8):
+    return float(np.linalg.norm(vec) + eps)
+
+
+def _is_finite_np(arr):
+    return bool(np.isfinite(np.asarray(arr)).all())
+
+
 def load_model(args):
     model_path = os.path.expanduser(args.model_path)
     model_name = get_model_name_from_path(model_path)
@@ -259,11 +270,28 @@ def preprocess_multimodal(
 
 def rotation_matrix_from_vector(x, y):
     v_x = np.array([x, y, 0])
-    v_x = v_x / np.linalg.norm(v_x)
+    v_norm = np.linalg.norm(v_x)
+    if v_norm < 1e-6 or not np.isfinite(v_norm):
+        # Keep legacy axis convention but avoid NaN matrix when target projection is near zero.
+        v_x = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    else:
+        v_x = v_x / v_norm
     v_y = np.array([-v_x[1], v_x[0], 0])
-    v_y = v_y / np.linalg.norm(v_y)
+    y_norm = np.linalg.norm(v_y)
+    if y_norm < 1e-6 or not np.isfinite(y_norm):
+        v_y = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    else:
+        v_y = v_y / y_norm
     v_z = np.array([0, 0, 1])
     rotation_matrix = np.column_stack((v_x, v_y, v_z))
+    if WAYPOINT_FLOW_DEBUG:
+        det_val = float(np.linalg.det(rotation_matrix))
+        logger.info(
+            "WAYPOINT_FLOW rot_to_target x=%.4f y=%.4f det=%.6f row0=%s row1=%s",
+            float(x), float(y), det_val,
+            np.round(rotation_matrix[0], 4).tolist(),
+            np.round(rotation_matrix[1], 4).tolist(),
+        )
     return rotation_matrix
 
 def transform_point(point, rotation_matrix):
@@ -318,7 +346,7 @@ def prepare_data_to_inputs(episodes, tokenizer, image_processor, data_args, targ
         deltas.append((np.array(source['sensors']['state']['position']) - pos))
     history_waypoint = np.array([(rot.T @ delta) for delta in deltas])
     rotation_to_target = None
-    
+
     target_point = np.array(rot.T @ (target_point - pos))
     x, y = target_point[0], target_point[1]
     rotation_to_target = rotation_matrix_from_vector(x, y)

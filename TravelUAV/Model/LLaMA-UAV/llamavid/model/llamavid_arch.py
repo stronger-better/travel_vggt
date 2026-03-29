@@ -18,6 +18,7 @@
 
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
+import logging
 import os
 import json
 import numpy as np
@@ -37,6 +38,8 @@ from .multimodal_projector.builder import build_vision_projector
 
 from llamavid.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, WP_TOKEN_INDEX, HIS_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
+logger = logging.getLogger(__name__)
+
 
 class LLaMAVIDMetaModel:
 
@@ -52,6 +55,16 @@ class LLaMAVIDMetaModel:
         if type(vision_tower) is list:
             vision_tower = vision_tower[0]
         return vision_tower
+
+    def _waypoint_flow_log_once(self, key, message, *args):
+        logged_keys = getattr(self, "_waypoint_flow_logged_keys", None)
+        if logged_keys is None:
+            logged_keys = set()
+            self._waypoint_flow_logged_keys = logged_keys
+        if key in logged_keys:
+            return
+        logger.info(message, *args)
+        logged_keys.add(key)
 
     def initialize_vision_modules(self, model_args, fsdp=None, max_token=2048):
         vision_tower = model_args.vision_tower
@@ -544,7 +557,19 @@ class LLaMAVIDMetaForCausalLM(ABC):
                     vggt_3d_tokens_list = proj_out.view(B, S, -1, proj_out.shape[-1])
                     if not torch.isfinite(vggt_3d_tokens_list).all():
                         vggt_3d_tokens_list = None
-            
+            if vggt_3d_tokens_list is not None:
+                self._waypoint_flow_log_once(
+                    "vggt_3d_tokens_ready",
+                    "WAYPOINT_FLOW vggt_3d_tokens status=ready shape=%s dtype=%s",
+                    list(vggt_3d_tokens_list.shape),
+                    str(vggt_3d_tokens_list.dtype),
+                )
+            else:
+                self._waypoint_flow_log_once(
+                    "vggt_3d_tokens_missing",
+                    "WAYPOINT_FLOW vggt_3d_tokens status=missing after projector",
+                )
+             
         elif vggt_latent_projector is not None:
             # ==========================================
             # [关键修复] 防止 DDP 死锁：生成 0 张量过一遍 Projector 和 Evo-0 Fusion
@@ -674,12 +699,24 @@ class LLaMAVIDMetaForCausalLM(ABC):
                     # 临时增加 Batch 维度: [1, Seq, Hidden]
                     q_img = current_image_feature.unsqueeze(0)
                     kv_vggt = vggt_3d_tokens.to(device=q_img.device, dtype=q_img.dtype).unsqueeze(0)
-                    
+                    fused_applied = False
+                    fused_shape = None
+                     
                     # 用当前 2D 图像做 Query，VGGT 空间特征做 KV
                     if torch.isfinite(q_img).all() and torch.isfinite(kv_vggt).all():
                         fused_feature = self.evo_fusion(q_img, kv_vggt)
+                        fused_shape = list(fused_feature.shape)
                         if torch.isfinite(fused_feature).all():
                             current_image_feature = fused_feature.squeeze(0)
+                            fused_applied = True
+                    self._waypoint_flow_log_once(
+                        "evo0_fusion_apply",
+                        "WAYPOINT_FLOW evo0_fusion applied=%s q_shape=%s kv_shape=%s out_shape=%s",
+                        fused_applied,
+                        list(q_img.shape),
+                        list(kv_vggt.shape),
+                        fused_shape,
+                    )
                     # 注意：融合后 current_image_feature 已经被附魔了 3D 空间特征，且 Shape 没变！
                 # ==========================================
 

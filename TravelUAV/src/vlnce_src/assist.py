@@ -1,20 +1,22 @@
-import numpy as np
 import math
 import torch
 import cv2
 import os
+import numpy as np
 from PIL import Image
 from src.vlnce_src.env_uav import RGB_FOLDER, DEPTH_FOLDER
 from collections import deque
+
+
 class Assist:
-    def __init__(self, always_help = False, use_gt = False, device=0):
+    def __init__(self, always_help=False, use_gt=False, device=0):
         self.always_help = always_help
         self.use_gt = use_gt
         self.dino_monitor = None
         self.dino_results = []
         self.depth_results = []
         self.recent_help_deque = deque(maxlen=9)
-    
+
     def find_shortest_pos(self, cur_pos, traj):
         x, y, z = cur_pos[0], cur_pos[1], cur_pos[2]
         shortest_distance = 99999
@@ -22,7 +24,7 @@ class Assist:
         true_index = -1
         for i in range(len(traj)):
             pos = traj[i]['position']
-            cur_distance = math.sqrt((pos[0]-x)**2 + (pos[1]-y)**2)
+            cur_distance = math.sqrt((pos[0] - x) ** 2 + (pos[1] - y) ** 2)
             if cur_distance < shortest_distance:
                 shortest_distance = cur_distance
                 shortest_pos = pos
@@ -30,9 +32,9 @@ class Assist:
 
         shortest_distance = 99999
         shortest_pos = None
-        for i in range(min(true_index, len(traj)-1), len(traj)):
+        for i in range(min(true_index, len(traj) - 1), len(traj)):
             pos = traj[i]['position']
-            cur_distance = math.sqrt((pos[0]-x)**2 + (pos[1]-y)**2)
+            cur_distance = math.sqrt((pos[0] - x) ** 2 + (pos[1] - y) ** 2)
             if (cur_distance < shortest_distance and cur_distance > 3) or (i == len(traj) - 1):
                 shortest_distance = cur_distance
                 shortest_pos = pos
@@ -48,39 +50,38 @@ class Assist:
                 if not dones[i]:
                     dones[i] = True
                 continue
-            
+
             diffs = []
             close_collision = False
             current_episode = current_observations[i]
             for cid, camera_name in enumerate(DEPTH_FOLDER):
                 diff = np.mean(np.abs(prev_episode[-1]['depth'][cid] - current_episode[-1]['depth'][cid]))
-                zero_cnt  = (current_episode[-1]['depth'][cid] <= 1).sum()
+                zero_cnt = (current_episode[-1]['depth'][cid] <= 1).sum()
                 if zero_cnt > 0.1 * current_episode[-1]['depth'][cid].size:
                     close_collision = True
                 diffs.append(diff)
             distance = np.array(prev_episode[-1]["sensors"]["state"]["position"]) - np.array(current_episode[-1]["sensors"]["state"]["position"])
             distance = np.linalg.norm(np.array(distance))
-            diffs = np.array(diffs)
-            if np.all(diffs < 3):
+            if np.all(diff < 3):
                 collision_type = 'tiny diff'
             elif close_collision:
                 collision_type = 'close'
             elif distance < 0.1:
                 collision_type = 'distance'
-            
+
             if collision_type is not None:
                 print('collision type: ', collision_type)
             collisions[i] = np.all(diff < 3) or close_collision or distance < 0.1
             if collisions[i] and not dones[i]:
                 dones[i] = True
         return collisions, dones
-    
+
     def depth_detection(self, episodes):
         self.depth_results = []
         is_helps = [False for _ in range(len(episodes))]
         for i in range(len(episodes)):
             depth_result = []
-            for cid, camera_name in enumerate(RGB_FOLDER):       
+            for cid, camera_name in enumerate(RGB_FOLDER):
                 img_src = episodes[i][-1]['depth'][cid]
                 img_src = np.array(img_src[64:192, 64:192])
                 depth = min(min(row) for row in img_src) / 2.55
@@ -93,7 +94,7 @@ class Assist:
                     is_helps[i] = True
             self.depth_results.append(depth_result)
         return is_helps
-    
+
     def judge_helps(self, episodes, object_infos):
         is_helps = self.depth_detection(episodes)
         self.dino_target_detection(episodes, object_infos)
@@ -104,7 +105,7 @@ class Assist:
         print("dino_results:", self.dino_results)
         print("depth_reslts:", self.depth_results)
         return is_helps
-    
+
     def get_assist_notice_with_gt(self, episodes, trajs, is_helps):
         try:
             assist_notices = [None for _ in range(len(episodes))]
@@ -128,38 +129,44 @@ class Assist:
                 distance_to_end = np.linalg.norm(np.array(cur_pos[0:2]) - np.array(last_pos[0:2]))
                 state = 'cruise'
 
-                if np.argmax(axis_ratio) == 2 or cur_vec[2] < 0 or distance_to_end < 10: 
+                if np.argmax(axis_ratio) == 2 or cur_vec[2] < 0 or distance_to_end < 10:
                     if cur_vec[2] < -3:
                         state = 'take off'
                     elif cur_vec[2] < 0:
                         if self.always_help:
                             self.depth_detection(episodes)
                         if self.depth_results[i][-1] < 7:
-                            state = 'take off' 
+                            state = 'take off'
                         else:
-                            pre_vec = pre_vec[0:2] 
+                            pre_vec = pre_vec[0:2]
                             cur_vec = cur_vec[0:2]
-                            delta_angle = np.arccos(np.dot(pre_vec, cur_vec) / (np.linalg.norm(pre_vec) + 1e-6) / (np.linalg.norm(cur_vec) + 1e-6)) * 180 / np.pi
+                            delta_angle = np.arccos(
+                                np.dot(pre_vec, cur_vec) / (np.linalg.norm(pre_vec) + 1e-6) / (np.linalg.norm(cur_vec) + 1e-6)
+                            ) * 180 / np.pi
                             if delta_angle > 20:
                                 if int(np.cross(pre_vec, cur_vec)) > 0:
                                     state = 'right'
                                 else:
-                                    state = 'left'  
+                                    state = 'left'
                     elif cur_vec[2] > 7 or distance_to_end < 10:
                         state = 'landing'
                     else:
-                        pre_vec = pre_vec[0:2] 
+                        pre_vec = pre_vec[0:2]
                         cur_vec = cur_vec[0:2]
-                        delta_angle = np.arccos(np.dot(pre_vec, cur_vec) / (np.linalg.norm(pre_vec) + 1e-6) / (np.linalg.norm(cur_vec) + 1e-6)) * 180 / np.pi
+                        delta_angle = np.arccos(
+                            np.dot(pre_vec, cur_vec) / (np.linalg.norm(pre_vec) + 1e-6) / (np.linalg.norm(cur_vec) + 1e-6)
+                        ) * 180 / np.pi
                         if delta_angle > 20:
                             if int(np.cross(pre_vec, cur_vec)) > 0:
                                 state = 'right'
                             else:
-                                state = 'left'  
+                                state = 'left'
                 else:
-                    pre_vec = pre_vec[0:2] 
+                    pre_vec = pre_vec[0:2]
                     cur_vec = cur_vec[0:2]
-                    delta_angle = np.arccos(np.dot(pre_vec, cur_vec) / (np.linalg.norm(pre_vec) + 1e-6) / (np.linalg.norm(cur_vec) + 1e-6)) * 180 / np.pi
+                    delta_angle = np.arccos(
+                        np.dot(pre_vec, cur_vec) / (np.linalg.norm(pre_vec) + 1e-6) / (np.linalg.norm(cur_vec) + 1e-6)
+                    ) * 180 / np.pi
                     if delta_angle > 20:
                         if int(np.cross(pre_vec, cur_vec)) > 0:
                             state = 'right'
@@ -167,11 +174,12 @@ class Assist:
                             state = 'left'
                 assist_notices[i] = state
         except Exception as e:
-            import pdb; pdb.set_trace()
+            import pdb
+            pdb.set_trace()
             print(f'Debug: {e}')
-        
+
         return assist_notices
-    
+
     def get_assist_notice_with_rule(self, episodes, object_infos, target_positions, is_helps):
         assist_notices = [None for _ in range(len(episodes))]
         if self.always_help:
@@ -225,7 +233,7 @@ class Assist:
         else:
             assist_notices = self.get_assist_notice_with_rule(episodes, object_infos, target_positions, is_helps)
         return assist_notices
-    
+
     def dino_target_detection(self, episodes, object_infos) -> list[list]:
         target_detections = []
         if self.dino_monitor is None:
@@ -233,17 +241,11 @@ class Assist:
             self.dino_monitor = DinoMonitor.get_instance()
         for idx, (epi, obj_info) in enumerate(zip(episodes, object_infos)):
             cameras_detect = [False] * len(RGB_FOLDER)
-            for cid, camera_name in enumerate(RGB_FOLDER):       
+            for cid, camera_name in enumerate(RGB_FOLDER):
                 img = Image.fromarray(epi[-1]['rgb'][cid])
                 boxes, _ = self.dino_monitor.detect(img, obj_info)
                 if len(boxes) > 0:
                     cameras_detect[cid] = True
-                # dest = cv2.cvtColor(img_src, cv2.COLOR_RGB2BGR)
-                # if len(boxes) > 0:
-                #     for point in boxes:
-                #         point = list(map(int, point))
-                #         dest = cv2.rectangle(dest, point[0:2], point[2:], (0,0,255), thickness=None, lineType=None, shift=None)
-                #     cv2.imwrite(os.path.join(f'test/dino_{idx}_{prompt}_{camera_name}.png'), dest)
             target_detections.append(cameras_detect)
         self.dino_results = target_detections
         return target_detections

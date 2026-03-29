@@ -293,7 +293,7 @@ class AirVLNSimulatorClientTool:
 
     def move_path_by_waypoints(self, waypoints_list, start_states):
         velocity = 1
-        drivetrain = airsim.DrivetrainType.MaxDegreeOfFreedom
+        drivetrain = airsim.DrivetrainType.ForwardOnly
         yaw_mode=airsim.YawMode(is_rate=False)
         lookahead=3
         adaptive_lookahead=1
@@ -301,163 +301,52 @@ class AirVLNSimulatorClientTool:
             results = []
             state_sensor = State(airsim_client, )
             imu_sensor = Imu(airsim_client, imu_name='Imu')
-
-            def fallback_move_by_points(path_points, target_count):
-                fallback_results = []
-                fallback_collision = False
-                min_reach_threshold = 0.2
-                max_reach_threshold = 0.6
-                per_target_timeout = 2.0
-                for idx in range(target_count):
-                    target_point = path_points[idx]
-                    airsim_client.moveToPositionAsync(
-                        target_point.x_val,
-                        target_point.y_val,
-                        target_point.z_val,
-                        max(velocity, 2),
-                        drivetrain=airsim.DrivetrainType.MaxDegreeOfFreedom,
-                        yaw_mode=yaw_mode,
-                    )
-                    begin = time.perf_counter()
-                    state_info = None
-                    imu_info = None
-                    reached = False
-                    while time.perf_counter() - begin < per_target_timeout:
-                        time.sleep(0.05)
-                        state_info = copy.deepcopy(state_sensor.retrieve())
-                        imu_info = copy.deepcopy(imu_sensor.retrieve())
-                        current_position = np.array(state_info['position'])
-                        target_position = np.array([target_point.x_val, target_point.y_val, target_point.z_val])
-                        distance_to_target = float(np.linalg.norm(current_position - target_position))
-                        dynamic_reach_threshold = float(np.clip(distance_to_target * 0.25, min_reach_threshold, max_reach_threshold))
-                        if distance_to_target <= dynamic_reach_threshold:
-                            reached = True
-                            break
-                    try:
-                        airsim_client.cancelLastTask()
-                    except Exception:
-                        pass
-                    if state_info is None:
-                        state_info = copy.deepcopy(state_sensor.retrieve())
-                    if imu_info is None:
-                        imu_info = copy.deepcopy(imu_sensor.retrieve())
-                    fallback_results.append({'sensors': {'state': state_info, 'imu': imu_info}})
-                    if not reached:
-                        fallback_collision = True
-                        break
-                return {'states': fallback_results, 'collision': fallback_collision}
-
+            path = [airsim.Vector3r(*waypoint[0:3]) for waypoint in waypoints]
             airsim_client.enableApiControl(True)
             airsim_client.armDisarm(True)
             airsim_client.simPause(False)
-            airsim_client.simSetKinematics(start_state, ignore_collision=True)
-            try:
-                airsim_client.simContinueForFrames(1)
-            except Exception:
-                pass
+            airsim_client.simSetKinematics(start_state, ignore_collision=False)
             state_info = state_sensor.retrieve()
-            start_position = np.array(state_info['position'], dtype=np.float32)
-
-            raw_points = [np.array(waypoint[0:3], dtype=np.float32) for waypoint in waypoints]
-            finite_raw_points = [point for point in raw_points if np.isfinite(point).all()]
-            filtered_points = []
-            last_point = start_position
-            min_start_distance = 0.5
-            min_segment_distance = 0.35
-            max_segment_distance = 8.0
-
-            for point in raw_points:
-                if not np.isfinite(point).all():
-                    continue
-                if np.linalg.norm(point - start_position) < min_start_distance:
-                    continue
-                seg = point - last_point
-                seg_len = np.linalg.norm(seg)
-                if seg_len < min_segment_distance:
-                    continue
-                if seg_len > max_segment_distance:
-                    point = last_point + seg / (seg_len + 1e-8) * max_segment_distance
-                filtered_points.append(point)
-                last_point = point
-
-            if not filtered_points and len(finite_raw_points) > 0:
-                fallback = finite_raw_points[-1]
-                seg = fallback - start_position
-                seg_len = np.linalg.norm(seg)
-                if seg_len < min_start_distance:
-                    fallback = start_position + np.array([2.0, 0.0, 0.0], dtype=np.float32)
-                elif seg_len > max_segment_distance:
-                    fallback = start_position + seg / (seg_len + 1e-8) * max_segment_distance
-                filtered_points = [fallback]
-
-            path = [airsim.Vector3r(*point.tolist()) for point in filtered_points]
-            if len(path) == 0:
-                return {'states': results, 'collision': True}
-            if len(path) == 1:
-                return fallback_move_by_points(path, 1)
             airsim_client.moveOnPathAsync(path=path, 
                                 velocity=velocity, 
                                 drivetrain=drivetrain, 
                                 yaw_mode=yaw_mode, 
                                 lookahead=lookahead, 
                                 adaptive_lookahead=adaptive_lookahead)
-            target_idx = min(5, len(path))
+            target_idx = 5
             current_idx = 0
-            # Give moveOnPathAsync enough time to start accelerating before
-            # treating low motion as a true stall.
-            pos_queue = deque(maxlen=60)
+            pos_queue = deque(maxlen=20)
             start_time = time.perf_counter()
             collision = False
-            segment_best_distance = float("inf")
-            segment_start_time = time.perf_counter()
-            stall_hits = 0
-            warmup_seconds = 1.2
-            max_path_runtime = 10.0
-            min_progress_distance = 0.15
-            required_stall_hits = 12
+            distance = 10000
             while True:
                 time.sleep(0.005)
-                elapsed = time.perf_counter() - start_time
-                if elapsed > max_path_runtime:
+                if time.perf_counter() - start_time > 5:
                     return None
                 target = path[current_idx]
                 state_info = copy.deepcopy(state_sensor.retrieve())
                 imu_info = copy.deepcopy(imu_sensor.retrieve())
                 position = np.array(state_info['position'])
                 pos_queue.append(position)
-                if len(pos_queue) == pos_queue.maxlen and elapsed > warmup_seconds:
+                if len(pos_queue) == pos_queue.maxlen:
                     recent_loc = position
-                    history_loc = pos_queue[0]
-                    delta_distance = np.linalg.norm(history_loc - recent_loc)
-                    if delta_distance < min_progress_distance:
-                        stall_hits += 1
-                    else:
-                        stall_hits = 0
-                    if stall_hits >= required_stall_hits:
+                    history_loc = pos_queue.popleft()
+                    delta_distance = np.linalg.norm(history_loc -recent_loc)
+                    if delta_distance < 0.1:
                         print('move on path api: stuck max len')
-                        try:
-                            airsim_client.cancelLastTask()
-                        except Exception:
-                            pass
-                        return fallback_move_by_points(path, target_idx)
-                new_distance = float(np.linalg.norm(position - np.array([target.x_val, target.y_val, target.z_val])))
-                segment_best_distance = min(segment_best_distance, new_distance)
-                segment_elapsed = time.perf_counter() - segment_start_time
-                reach_radius = 0.35
-                passby_margin = 0.12
-                reached_current = (
-                    new_distance <= reach_radius or
-                    (segment_best_distance <= reach_radius and new_distance > segment_best_distance + passby_margin)
-                )
-                if reached_current:
+                        collision = True
+                        break
+                new_distance = np.linalg.norm(position - np.array([target.x_val, target.y_val, target.z_val]))
+                if new_distance > distance:
                     results.append({'sensors': {'state': state_info, 'imu': imu_info}})
                     current_idx += 1
                     if current_idx == target_idx:
                         airsim_client.simPause(True)
                         break
                     else:
-                        segment_best_distance = float("inf")
-                        segment_start_time = time.perf_counter()
+                        distance = 10000
+                else:
+                    distance = new_distance
             return {'states': results, 'collision': collision}
         
         threads = []

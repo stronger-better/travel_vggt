@@ -1152,7 +1152,7 @@ def train():
         lora_config = LoraConfig(
             r=training_args.lora_r,
             lora_alpha=training_args.lora_alpha,
-            target_modules=find_all_linear_names(model),
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
             layers_to_transform=[i for i in range(0, 32)], 
             lora_dropout=training_args.lora_dropout,
             bias=training_args.lora_bias,

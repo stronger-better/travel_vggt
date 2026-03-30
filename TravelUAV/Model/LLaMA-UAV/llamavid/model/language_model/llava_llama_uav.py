@@ -12,7 +12,10 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+import inspect
 import os
+import sys
+from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -26,6 +29,11 @@ from llamavid.model.llamavid_arch import LLaMAVIDMetaModel, LLaMAVIDMetaForCausa
 from llamavid.model.language_model.llama_uav import LlamaUAVModel, LlamaUAVForCausalLM, CausalLMOutputWithPastUAV, CausalLMOutputWithPastUAVMulLoss
 
 from llamavid.constants import WAYPOINT_LABEL_TOKEN
+
+_REPO_ROOT = Path(__file__).resolve().parents[6]
+_VGGT_SRC = _REPO_ROOT / "vggt"
+if _VGGT_SRC.is_dir() and str(_VGGT_SRC) not in sys.path:
+    sys.path.insert(0, str(_VGGT_SRC))
 
 from vggt.models.vggt import VGGT
 
@@ -110,18 +118,29 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
         # VGGT Latent 提取器 初始化
         # ==========================================
         self.vggt_model = VGGT(
-            img_size=224, 
-            patch_size=14,
-            embed_dim=1024,
             enable_camera=False, 
             enable_point=False, # 关闭所有预测头以节省显存，只用 Latent
             enable_depth=False, 
             enable_track=False
         )
+        try:
+            logger.info(
+                "WAYPOINT_FLOW vggt_import module=%s file=%s",
+                VGGT.__module__,
+                inspect.getfile(VGGT),
+            )
+        except Exception:
+            logger.info("WAYPOINT_FLOW vggt_import module=%s", VGGT.__module__)
         requested_vggt_model_path = (
             model_args.get("vggt_model_path")
             or getattr(config, "vggt_model_path", None)
             or os.environ.get("VGGT_MODEL_PATH")
+        )
+        requested_vggt_model_repo = (
+            model_args.get("vggt_model_repo")
+            or getattr(config, "vggt_model_repo", None)
+            or os.environ.get("VGGT_MODEL_REPO")
+            or "facebook/VGGT-1B"
         )
         requested_vggt_model_url = (
             model_args.get("vggt_model_url")
@@ -158,7 +177,32 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
         if (not loaded_vggt_weights) and should_auto_download_vggt:
             try:
                 logger.info(
-                    "WAYPOINT_FLOW vggt_weights downloading url=%s",
+                    "WAYPOINT_FLOW vggt_weights from_pretrained repo=%s",
+                    requested_vggt_model_repo,
+                )
+                self.vggt_model = VGGT.from_pretrained(
+                    requested_vggt_model_repo,
+                    enable_camera=False,
+                    enable_point=False,
+                    enable_depth=False,
+                    enable_track=False,
+                )
+                logger.info(
+                    "WAYPOINT_FLOW vggt_weights loaded_from_repo repo=%s",
+                    requested_vggt_model_repo,
+                )
+                self.config.vggt_model_repo = requested_vggt_model_repo
+                loaded_vggt_weights = True
+            except Exception as exc:
+                logger.warning(
+                    "WAYPOINT_FLOW vggt_weights from_pretrained_failed repo=%s error=%s",
+                    requested_vggt_model_repo,
+                    exc,
+                )
+        if (not loaded_vggt_weights) and should_auto_download_vggt:
+            try:
+                logger.info(
+                    "WAYPOINT_FLOW vggt_weights downloading_fallback url=%s",
                     requested_vggt_model_url,
                 )
                 vggt_checkpoint = torch.hub.load_state_dict_from_url(
@@ -167,7 +211,7 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
                 )
                 load_result = _load_vggt_state_dict(self.vggt_model, vggt_checkpoint)
                 logger.info(
-                    "WAYPOINT_FLOW vggt_weights downloaded missing=%d unexpected=%d",
+                    "WAYPOINT_FLOW vggt_weights downloaded_fallback missing=%d unexpected=%d",
                     len(load_result.missing_keys),
                     len(load_result.unexpected_keys),
                 )
@@ -181,7 +225,7 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
                 loaded_vggt_weights = True
             except Exception as exc:
                 logger.warning(
-                    "WAYPOINT_FLOW vggt_weights download_failed url=%s error=%s",
+                    "WAYPOINT_FLOW vggt_weights fallback_failed url=%s error=%s",
                     requested_vggt_model_url,
                     exc,
                 )

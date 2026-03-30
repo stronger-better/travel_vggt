@@ -71,6 +71,12 @@ class TravelModelWrapper(BaseModelWrapper):
                     float(vggt_images.min().item()),
                     float(vggt_images.max().item()),
                 )
+                if vggt_images.ndim >= 5 and (vggt_images.shape[-2] != 518 or vggt_images.shape[-1] != 518):
+                    logger.warning(
+                        "WAYPOINT_FLOW vggt_images unexpected_hw=%sx%s expected=518x518",
+                        int(vggt_images.shape[-2]),
+                        int(vggt_images.shape[-1]),
+                    )
                 self._logged_vggt_images_stats = True
         elif not self._logged_vggt_images_stats:
             logger.warning(

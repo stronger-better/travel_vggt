@@ -146,6 +146,8 @@ class DataArguments:
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
     cache_dir: Optional[str] = field(default=None)
+    resume_checkpoint_path: Optional[str] = field(default=None)
+    auto_resume: bool = field(default=False)
     optim: str = field(default="adamw_torch")
     remove_unused_columns: bool = field(default=False)
     freeze_mm_mlp_adapter: bool = field(default=False)
@@ -238,18 +240,17 @@ def find_all_linear_names(model):
     lora_module_names = set()
     # multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler', 'vlm_att']
     multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler', 'vlm_att', 'waypoint_emb', 'waypoints_fc', 'waypoints_predictor',
-                         'waypoints_output', 'history_predictor', 'history_preprocessor', 'is_help_predictor', 'evo_fusion', 'vggt_latent_projector'] # end_predictor
+                         'waypoints_output', 'history_predictor', 'history_preprocessor', 'is_help_predictor', 'evo_fusion', 'vggt_latent_projector', 'vggt_model'] # end_predictor
     
     for name, module in model.named_modules():
         if any(mm_keyword in name for mm_keyword in multimodal_keywords):
             continue
         if isinstance(module, cls):
-            names = name.split('.')
-            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
+            lora_module_names.add(name)
 
     if 'lm_head' in lora_module_names: # needed for 16-bit
         lora_module_names.remove('lm_head')
-    return list(lora_module_names)
+    return sorted(list(lora_module_names))
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
@@ -1164,10 +1165,11 @@ def train():
 
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model
+        lora_target_modules = find_all_linear_names(model)
         lora_config = LoraConfig(
             r=training_args.lora_r,
             lora_alpha=training_args.lora_alpha,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            target_modules=lora_target_modules,
             lora_dropout=training_args.lora_dropout,
             bias=training_args.lora_bias,
             task_type="CAUSAL_LM",
@@ -1178,6 +1180,7 @@ def train():
             if training_args.fp16:
                 model.to(torch.float16)
         rank0_print("Adding LoRA adapters...")
+        rank0_print(f"LoRA target modules ({len(lora_target_modules)}): {sorted(lora_target_modules)}")
         model = get_peft_model(model, lora_config)
 
     if 'mpt' in model_args.model_name_or_path:
@@ -1299,9 +1302,21 @@ def train():
                     tokenizer=tokenizer,
                     args=training_args,
                     **data_module)
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
+
+    checkpoint_dirs = sorted(pathlib.Path(training_args.output_dir).glob("checkpoint-*"))
+    resume_checkpoint = training_args.resume_checkpoint_path
+    if resume_checkpoint is None and training_args.auto_resume and checkpoint_dirs:
+        resume_checkpoint = str(checkpoint_dirs[-1])
+
+    if resume_checkpoint is not None:
+        rank0_print(f"Resuming training from checkpoint: {resume_checkpoint}")
+        trainer.train(resume_from_checkpoint=resume_checkpoint)
     else:
+        if checkpoint_dirs:
+            rank0_print(
+                f"Found {len(checkpoint_dirs)} existing checkpoints under {training_args.output_dir}, "
+                "but auto resume is disabled. Starting fresh optimizer/scheduler state."
+            )
         trainer.train()
     trainer.save_state()
 

@@ -10,6 +10,7 @@ from scipy.spatial.transform import Rotation as R
 import torch
 import numpy as np
 import math
+from PIL import Image
 
 
 sys.path.append(str(Path(str(os.getcwd())).resolve()))
@@ -34,6 +35,50 @@ def _safe_norm(vec, eps=1e-8):
 
 def _is_finite_np(arr):
     return bool(np.isfinite(np.asarray(arr)).all())
+
+
+def preprocess_vggt_images(images, target_size=518):
+    processed = []
+    for image in images:
+        image_np = np.asarray(image)
+        if image_np.dtype != np.uint8:
+            if np.issubdtype(image_np.dtype, np.floating):
+                max_val = float(np.nanmax(image_np)) if image_np.size > 0 else 0.0
+                if max_val <= 1.0 + 1e-6:
+                    image_np = np.clip(image_np * 255.0, 0.0, 255.0).astype(np.uint8)
+                else:
+                    image_np = np.clip(image_np, 0.0, 255.0).astype(np.uint8)
+            else:
+                image_np = np.clip(image_np, 0, 255).astype(np.uint8)
+
+        pil_image = Image.fromarray(image_np).convert("RGB")
+        width, height = pil_image.size
+        if width >= height:
+            new_width = target_size
+            new_height = round(height * (new_width / max(width, 1)) / 14) * 14
+        else:
+            new_height = target_size
+            new_width = round(width * (new_height / max(height, 1)) / 14) * 14
+
+        pil_image = pil_image.resize((new_width, new_height), Image.Resampling.BICUBIC)
+        tensor_image = torch.from_numpy(np.asarray(pil_image, dtype=np.float32) / 255.0).permute(2, 0, 1)
+
+        h_padding = target_size - tensor_image.shape[1]
+        w_padding = target_size - tensor_image.shape[2]
+        if h_padding > 0 or w_padding > 0:
+            pad_top = h_padding // 2
+            pad_bottom = h_padding - pad_top
+            pad_left = w_padding // 2
+            pad_right = w_padding - pad_left
+            tensor_image = torch.nn.functional.pad(
+                tensor_image,
+                (pad_left, pad_right, pad_top, pad_bottom),
+                mode="constant",
+                value=1.0,
+            )
+        processed.append(tensor_image)
+
+    return torch.stack(processed, dim=0)
 
 
 def load_model(args):
@@ -339,9 +384,7 @@ def prepare_data_to_inputs(episodes, tokenizer, image_processor, data_args, targ
     # ==========================================
     # [新增] 构建用于 VGGT 和 Evo0 Fusion 的 vggt_image
     # ==========================================
-    CLIP_MEAN = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1).to(image.device)
-    CLIP_STD = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1).to(image.device)
-    vggt_image = torch.clamp(image * CLIP_STD + CLIP_MEAN, 0.0, 1.0)
+    vggt_image = preprocess_vggt_images(images).to(device=image.device)
     # ==========================================
 
 

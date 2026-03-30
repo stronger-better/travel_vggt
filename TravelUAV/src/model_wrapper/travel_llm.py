@@ -1,11 +1,14 @@
-import logging
 import numpy as np
 import torch
 from src.model_wrapper.base_model import BaseModelWrapper
 from src.model_wrapper.utils.travel_util import *
 from src.vlnce_src.dino_monitor_online import DinoMonitor
 
-logger = logging.getLogger(__name__)
+try:
+    from utils.logger import logger
+except Exception:  # pragma: no cover - fallback for isolated imports
+    import logging
+    logger = logging.getLogger(__name__)
 
 
 class TravelModelWrapper(BaseModelWrapper):
@@ -69,6 +72,12 @@ class TravelModelWrapper(BaseModelWrapper):
                     float(vggt_images.max().item()),
                 )
                 self._logged_vggt_images_stats = True
+        elif not self._logged_vggt_images_stats:
+            logger.warning(
+                "WAYPOINT_FLOW vggt_images status=missing_in_batch keys=%s",
+                sorted(batch.keys()),
+            )
+            self._logged_vggt_images_stats = True
         inputs_device['historys'] = [item.to(device=self.model.device, dtype=self.model.dtype) for item in batch['historys']]
         inputs_device['orientations'] = inputs_device['orientations'].to(dtype=self.model.dtype)
         inputs_device['return_waypoints'] = True

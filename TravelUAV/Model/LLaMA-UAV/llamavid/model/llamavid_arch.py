@@ -18,7 +18,6 @@
 
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
-import logging
 import os
 import json
 import numpy as np
@@ -38,7 +37,22 @@ from .multimodal_projector.builder import build_vision_projector
 
 from llamavid.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, WP_TOKEN_INDEX, HIS_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
-logger = logging.getLogger(__name__)
+try:
+    from utils.logger import logger
+except Exception:  # pragma: no cover - fallback for isolated imports
+    import logging
+    logger = logging.getLogger(__name__)
+
+
+def _waypoint_flow_log_once(module, key, message, *args):
+    logged_keys = getattr(module, "_waypoint_flow_logged_keys", None)
+    if logged_keys is None:
+        logged_keys = set()
+        setattr(module, "_waypoint_flow_logged_keys", logged_keys)
+    if key in logged_keys:
+        return
+    logger.info(message, *args)
+    logged_keys.add(key)
 
 
 class LLaMAVIDMetaModel:
@@ -55,16 +69,6 @@ class LLaMAVIDMetaModel:
         if type(vision_tower) is list:
             vision_tower = vision_tower[0]
         return vision_tower
-
-    def _waypoint_flow_log_once(self, key, message, *args):
-        logged_keys = getattr(self, "_waypoint_flow_logged_keys", None)
-        if logged_keys is None:
-            logged_keys = set()
-            self._waypoint_flow_logged_keys = logged_keys
-        if key in logged_keys:
-            return
-        logger.info(message, *args)
-        logged_keys.add(key)
 
     def initialize_vision_modules(self, model_args, fsdp=None, max_token=2048):
         vision_tower = model_args.vision_tower
@@ -557,18 +561,50 @@ class LLaMAVIDMetaForCausalLM(ABC):
                     vggt_3d_tokens_list = proj_out.view(B, S, -1, proj_out.shape[-1])
                     if not torch.isfinite(vggt_3d_tokens_list).all():
                         vggt_3d_tokens_list = None
+                else:
+                    _waypoint_flow_log_once(
+                        self,
+                        "vggt_proj_out_nonfinite",
+                        "WAYPOINT_FLOW vggt_projector status=nonfinite min=%.4f max=%.4f",
+                        float(torch.nan_to_num(proj_out, nan=0.0, posinf=0.0, neginf=0.0).min().item()),
+                        float(torch.nan_to_num(proj_out, nan=0.0, posinf=0.0, neginf=0.0).max().item()),
+                    )
+            else:
+                _waypoint_flow_log_once(
+                    self,
+                    "vggt_latent_nonfinite",
+                    "WAYPOINT_FLOW vggt_latent status=nonfinite min=%.4f max=%.4f",
+                    float(torch.nan_to_num(latent_tokens, nan=0.0, posinf=0.0, neginf=0.0).min().item()),
+                    float(torch.nan_to_num(latent_tokens, nan=0.0, posinf=0.0, neginf=0.0).max().item()),
+                )
             if vggt_3d_tokens_list is not None:
-                self._waypoint_flow_log_once(
+                _waypoint_flow_log_once(
+                    self,
                     "vggt_3d_tokens_ready",
                     "WAYPOINT_FLOW vggt_3d_tokens status=ready shape=%s dtype=%s",
                     list(vggt_3d_tokens_list.shape),
                     str(vggt_3d_tokens_list.dtype),
                 )
             else:
-                self._waypoint_flow_log_once(
+                _waypoint_flow_log_once(
+                    self,
                     "vggt_3d_tokens_missing",
                     "WAYPOINT_FLOW vggt_3d_tokens status=missing after projector",
                 )
+        elif vggt_images is None:
+            _waypoint_flow_log_once(
+                self,
+                "vggt_images_none",
+                "WAYPOINT_FLOW vggt_images status=none before_vggt_branch",
+            )
+        elif vggt_model is None or vggt_latent_projector is None:
+            _waypoint_flow_log_once(
+                self,
+                "vggt_modules_missing",
+                "WAYPOINT_FLOW vggt_modules status=missing model=%s projector=%s",
+                vggt_model is not None,
+                vggt_latent_projector is not None,
+            )
              
         elif vggt_latent_projector is not None:
             # ==========================================
@@ -709,7 +745,8 @@ class LLaMAVIDMetaForCausalLM(ABC):
                         if torch.isfinite(fused_feature).all():
                             current_image_feature = fused_feature.squeeze(0)
                             fused_applied = True
-                    self._waypoint_flow_log_once(
+                    _waypoint_flow_log_once(
+                        self,
                         "evo0_fusion_apply",
                         "WAYPOINT_FLOW evo0_fusion applied=%s q_shape=%s kv_shape=%s out_shape=%s",
                         fused_applied,

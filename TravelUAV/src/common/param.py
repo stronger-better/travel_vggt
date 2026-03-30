@@ -76,6 +76,7 @@ class DataArguments:
 class ModelArguments:
     model_path: Optional[str] = field(default="facebook/opt-350m")
     model_base: Optional[str] = field(default=None)
+    vggt_model_path: Optional[str] = field(default=None)
     traj_model_path: Optional[str] = field(default=None)
     vision_tower: Optional[str] = field(default=None)
     image_processor: Optional[str] = field(default=None)
@@ -114,4 +115,3 @@ args.vocab_size = 10038
 default_config = CN.clone()
 default_config.make_dir_time = args.make_dir_time
 default_config.freeze()
-

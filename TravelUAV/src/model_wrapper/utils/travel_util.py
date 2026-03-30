@@ -39,7 +39,13 @@ def _is_finite_np(arr):
 def load_model(args):
     model_path = os.path.expanduser(args.model_path)
     model_name = get_model_name_from_path(model_path)
-    tokenizer, model, image_processor, _ = load_pretrained_model(model_path, args.model_base, model_name)
+    vggt_model_path = getattr(args, "vggt_model_path", None) or os.environ.get("VGGT_MODEL_PATH")
+    tokenizer, model, image_processor, _ = load_pretrained_model(
+        model_path,
+        args.model_base,
+        model_name,
+        vggt_model_path=vggt_model_path,
+    )
     
     smarter_tokenizer_and_embedding_resize(special_tokens_list=['<wp>', '<his>'], tokenizer=tokenizer, model=model)
     model.get_special_token_id({'<wp>': tokenizer.encode('<wp>')[1], '<his>': tokenizer.encode('<his>')[1],
@@ -60,14 +66,30 @@ def load_model(args):
         non_lora_weights = {}
         if os.path.exists(non_lora_path):
             non_lora_weights = torch.load(non_lora_path, map_location='cpu')
-            model.load_state_dict(non_lora_weights, strict=False)
+            non_lora_result = model.load_state_dict(non_lora_weights, strict=False)
+            missing_non_lora = [k for k in non_lora_result.missing_keys if ('evo_fusion' in k or 'vggt_latent_projector' in k)]
+            unexpected_non_lora = [k for k in non_lora_result.unexpected_keys if ('evo_fusion' in k or 'vggt_latent_projector' in k)]
+            if missing_non_lora or unexpected_non_lora:
+                logger.warning(
+                    "Checkpoint load(non_lora) mismatch missing=%s unexpected=%s",
+                    missing_non_lora[:8],
+                    unexpected_non_lora[:8],
+                )
         else:
             logger.warning("Missing non_lora_trainables.bin: %s", non_lora_path)
 
         mm_projector_weights = {}
         if os.path.exists(mm_projector_path):
             mm_projector_weights = torch.load(mm_projector_path, map_location='cpu')
-            model.load_state_dict(mm_projector_weights, strict=False)
+            mm_projector_result = model.load_state_dict(mm_projector_weights, strict=False)
+            missing_mm = [k for k in mm_projector_result.missing_keys if ('evo_fusion' in k or 'vggt_latent_projector' in k)]
+            unexpected_mm = [k for k in mm_projector_result.unexpected_keys if ('evo_fusion' in k or 'vggt_latent_projector' in k)]
+            if missing_mm or unexpected_mm:
+                logger.warning(
+                    "Checkpoint load(mm_projector) mismatch missing=%s unexpected=%s",
+                    missing_mm[:8],
+                    unexpected_mm[:8],
+                )
         else:
             logger.warning("Missing mm_projector.bin: %s", mm_projector_path)
 
@@ -333,10 +355,6 @@ def prepare_data_to_inputs(episodes, tokenizer, image_processor, data_args, targ
         "value": ""
     }]
     
-    if assist_notice is not None:
-        stage = assist_notice
-    else:
-        stage = 'cruise' if len(sources) > 20 else 'take off'
     rot = np.array(ori_sources[0]['sensors']['imu']["rotation"])
     pos = np.array(ori_sources[0]['sensors']['state']['position'])
     deltas = []
@@ -352,10 +370,21 @@ def prepare_data_to_inputs(episodes, tokenizer, image_processor, data_args, targ
     rotation_to_target = rotation_matrix_from_vector(x, y)
     history_waypoint = transform_point(history_waypoint, rotation_to_target)
 
+    if assist_notice is not None:
+        stage = assist_notice
+    else:
+        target_z_gap = float(target_point[2] - history_waypoint[-1][2])
+        if target_z_gap < -5.0:
+            stage = 'take off'
+        elif target_z_gap > 5.0:
+            stage = 'landing'
+        else:
+            stage = 'cruise'
+
     if len(history_waypoint) >= 2:
         delta = history_waypoint[-1] - history_waypoint[-2]
     else:
-        delta = np.array([0, 0, -4.5])
+        delta = np.array([0.0, 0.0, 0.0], dtype=np.float32)
     delta = delta / (np.linalg.norm(delta) + 1e-8)
     delta = ','.join([str(round(x, 1)) for x in delta])
     cur_pos = history_waypoint[-1]

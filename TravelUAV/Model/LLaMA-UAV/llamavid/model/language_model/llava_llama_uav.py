@@ -12,6 +12,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+import inspect
 import os
 from typing import List, Optional, Tuple, Union
 
@@ -81,6 +82,16 @@ class CosineDirectionLoss(nn.Module):
 
 class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
     config_class = LlavaConfig
+
+    @staticmethod
+    def _build_vggt_model():
+        return VGGT(
+            enable_camera=False,
+            enable_point=False,
+            enable_depth=False,
+            enable_track=False,
+        )
+
     def __init__(self, config, **model_args):
         super(LlamaUAVForCausalLM, self).__init__(config)
         self.model = LlavaAttLlamaModel(config)

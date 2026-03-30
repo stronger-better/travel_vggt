@@ -1,18 +1,32 @@
 #!/bin/bash
-# change the root_dir and dataset_path to your own path
+set -euo pipefail
+
+# Change these paths for your own server.
 export WANDB_MODE=offline
 export WANDB_DIR=/mnt/sfs_turbo_new/R10844/zhangpeilun/openuav_vggt/TravelUAV/Model/LLaMA-UAV/wandb
 export PATH=/mnt/sfs_turbo/R10840/anaconda3/envs/travel_vggt/bin:$PATH
 
-# 获取当前 conda 环境中 python 的 site-packages 路径
 SITE_PACKAGES="/mnt/sfs_turbo/R10840/anaconda3/envs/travel_vggt/lib/python3.10/site-packages"
+export LD_LIBRARY_PATH="${SITE_PACKAGES}/nvidia/cublas/lib:${SITE_PACKAGES}/nvidia/nccl/lib:${SITE_PACKAGES}/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
 
-# 强制将 PyTorch 随附的 NVIDIA 库排在系统环境变量的最前面
-export LD_LIBRARY_PATH="${SITE_PACKAGES}/nvidia/cublas/lib:${SITE_PACKAGES}/nvidia/nccl/lib:${SITE_PACKAGES}/nvidia/cudnn/lib:$LD_LIBRARY_PATH"
-root_dir=/mnt/sfs_turbo_new/R10844/zhangpeilun/openuav_vggt/TravelUAV # TravelUAV directory
+root_dir=/mnt/sfs_turbo_new/R10844/zhangpeilun/openuav_vggt/TravelUAV
 model_dir=$root_dir/Model/LLaMA-UAV
 
-# 设置CUDA设备
+# Offline VGGT settings.
+# Point this to the local VGGT model.pt that already exists on the server.
+VGGT_MODEL_PATH="${VGGT_MODEL_PATH:-/mnt/sfs_turbo_new/R10844/zhangpeilun/models/VGGT-1B/model.pt}"
+if [[ ! -f "$VGGT_MODEL_PATH" ]]; then
+    echo "VGGT model file not found: $VGGT_MODEL_PATH" >&2
+    echo "Please set VGGT_MODEL_PATH to your local VGGT model.pt path." >&2
+    exit 1
+fi
+
+# Force local-only loading and disable Hugging Face network access.
+export VGGT_AUTO_DOWNLOAD=0
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+
 # export CUDA_VISIBLE_DEVICES=5
 
 deepspeed \
@@ -21,10 +35,11 @@ deepspeed \
     $model_dir/llamavid/train/train_uav/train_uav_notice.py \
     --data_path $root_dir/data/uav_dataset/trainset.json \
     --dataset_path /mnt/sfs_turbo_new/R10844/zhangpeilun/project1/TravelUAV/dataset \
-    --output_dir $model_dir/work_dirs/evo-qwen-vid-7b-pretrain-224-uav-full-data-lora32 \
+    --output_dir $model_dir/work_dirs/evolve-evo-qwen-vid-7b-pretrain-224-uav-full-data-lora32 \
     --deepspeed $model_dir/scripts/zero2.json \
     --ddp_find_unused_parameters True \
     --model_name_or_path /mnt/sfs_turbo_new/R10844/zhangpeilun/openuav_vggt/TravelUAV/Model/LLaMA-UAV/model_zoo/vicuna-7b-v1.5 \
+    --vggt_model_path "$VGGT_MODEL_PATH" \
     --version imgsp_uav \
     --is_multimodal True \
     --vision_tower /mnt/sfs_turbo_new/R10844/zhangpeilun/openuav_vggt/TravelUAV/Model/LLaMA-UAV/model_zoo/LAVIS/eva_vit_g.pth \
@@ -60,4 +75,4 @@ deepspeed \
     --dataloader_num_workers 4 \
     --lazy_preprocess True \
     --report_to wandb \
-    --lora_enable True \
+    --lora_enable True

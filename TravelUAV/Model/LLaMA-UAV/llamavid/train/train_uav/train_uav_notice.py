@@ -55,6 +55,50 @@ local_rank = None
 CLIP_MEAN = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
 CLIP_STD = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
 
+
+def preprocess_vggt_images(images, target_size=518):
+    processed = []
+    for image in images:
+        image_np = np.asarray(image)
+        if image_np.dtype != np.uint8:
+            if np.issubdtype(image_np.dtype, np.floating):
+                max_val = float(np.nanmax(image_np)) if image_np.size > 0 else 0.0
+                if max_val <= 1.0 + 1e-6:
+                    image_np = np.clip(image_np * 255.0, 0.0, 255.0).astype(np.uint8)
+                else:
+                    image_np = np.clip(image_np, 0.0, 255.0).astype(np.uint8)
+            else:
+                image_np = np.clip(image_np, 0, 255).astype(np.uint8)
+
+        pil_image = Image.fromarray(image_np).convert("RGB")
+        width, height = pil_image.size
+        if width >= height:
+            new_width = target_size
+            new_height = round(height * (new_width / max(width, 1)) / 14) * 14
+        else:
+            new_height = target_size
+            new_width = round(width * (new_height / max(height, 1)) / 14) * 14
+
+        pil_image = pil_image.resize((new_width, new_height), Image.Resampling.BICUBIC)
+        tensor_image = torch.from_numpy(np.asarray(pil_image, dtype=np.float32) / 255.0).permute(2, 0, 1)
+
+        h_padding = target_size - tensor_image.shape[1]
+        w_padding = target_size - tensor_image.shape[2]
+        if h_padding > 0 or w_padding > 0:
+            pad_top = h_padding // 2
+            pad_bottom = h_padding - pad_top
+            pad_left = w_padding // 2
+            pad_right = w_padding - pad_left
+            tensor_image = torch.nn.functional.pad(
+                tensor_image,
+                (pad_left, pad_right, pad_top, pad_bottom),
+                mode="constant",
+                value=1.0,
+            )
+        processed.append(tensor_image)
+
+    return torch.stack(processed, dim=0)
+
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
@@ -856,21 +900,49 @@ class LazySupervisedDataset(Dataset):
             # ==========================================
             # [新增] VGGT 原始图像反归一化恢复
             # ==========================================
-            mean = CLIP_MEAN.to(image.device, dtype=image.dtype)
-            std = CLIP_STD.to(image.device, dtype=image.dtype)
+            vggt_image = None
+            index_list = sources[0].get('index')
+            if index_list is not None and 0 <= (frame_num - 1) < len(index_list):
+                real_index = index_list[frame_num - 1]
+                rgb_paths = [
+                    os.path.join(traj_dir, name, str(real_index).zfill(6) + '.png')
+                    for name in self.__class__.RGB_FOLDER
+                ]
+                if all(os.path.exists(path) for path in rgb_paths):
+                    raw_images = [np.asarray(Image.open(path).convert('RGB')) for path in rgb_paths]
+                    vggt_image = preprocess_vggt_images(raw_images).to(dtype=image.dtype)
+
+            if vggt_image is None:
+                mean = CLIP_MEAN.to(image.device, dtype=image.dtype)
+                std = CLIP_STD.to(image.device, dtype=image.dtype)
             # 还原至 [0, 1] 范围，clamp 防止浮点误差导致越界
-            vggt_image = torch.clamp(image * std + mean, 0.0, 1.0)
+                clip_images = torch.clamp(image * std + mean, 0.0, 1.0)
+                clip_images = clip_images.permute(0, 2, 3, 1).cpu().numpy()
+                vggt_image = preprocess_vggt_images(clip_images).to(dtype=image.dtype)
 
-            stage, future_delta, assist = self.get_stage(sources[0]['trajectory'], frame_num)
-
-            cur_pos = sources[0]['trajectory'][frame_num - 1][:3]
-            x, y = ori_sources[0]['trajectory'][-1][0], ori_sources[0]['trajectory'][-1][1]
+            history_waypoint = np.asarray(sources[0]['trajectory'][:frame_num, :3], dtype=np.float32)
+            target_point = np.asarray(ori_sources[0]['trajectory'][-1][:3], dtype=np.float32)
+            x, y = float(target_point[0]), float(target_point[1])
             rotation_matrix = rotation_matrix_from_vector(x, y)
-            future_delta =  transform_point(future_delta, rotation_matrix)
-            future_delta = future_delta / (np.linalg.norm(future_delta) + 1e-8)
-            future_delta_str = ','.join([str(round(x, 1)) for x in future_delta])
-            
-            cur_pos = transform_point(cur_pos, rotation_matrix)
+            history_waypoint = transform_point(history_waypoint, rotation_matrix)
+            target_point = transform_point(target_point, rotation_matrix)
+
+            target_z_gap = float(target_point[2] - history_waypoint[-1][2])
+            if target_z_gap < -5.0:
+                stage = 'take off'
+            elif target_z_gap > 5.0:
+                stage = 'landing'
+            else:
+                stage = 'cruise'
+
+            if len(history_waypoint) >= 2:
+                delta = history_waypoint[-1] - history_waypoint[-2]
+            else:
+                delta = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            delta = delta / (np.linalg.norm(delta) + 1e-8)
+            delta_str = ','.join([str(round(x, 1)) for x in delta])
+
+            cur_pos = history_waypoint[-1]
             cur_pos_str = ','.join([str(round(x, 1)) for x in cur_pos])
             
             """
@@ -888,8 +960,13 @@ class LazySupervisedDataset(Dataset):
             # image = processor.preprocess(history_images, return_tensors='pt')['pixel_values']
             # print(f"Load image time/frames: {t2-t1} / {frame_num}")
             """
-            sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]),
-                    self.data_args, stage=stage, delta = future_delta_str, cur = cur_pos_str)
+            sources = preprocess_multimodal(
+                copy.deepcopy([e["conversations"] for e in sources]),
+                self.data_args,
+                stage=stage,
+                delta=delta_str,
+                cur=cur_pos_str,
+            )
 
         elif 'image' in sources[0]:
             image_file = self.list_data_dict[i]['image']

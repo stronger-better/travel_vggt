@@ -81,6 +81,9 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
                 model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
 
+    if hasattr(model, "initialize_vggt_weights"):
+        model.initialize_vggt_weights()
+
     image_processor = None
 
     if 'vid' or 'uav' in model_name.lower():

@@ -131,111 +131,26 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
             )
         except Exception:
             logger.info("WAYPOINT_FLOW vggt_import module=%s", VGGT.__module__)
-        requested_vggt_model_path = (
+        self.config.vggt_model_path = (
             model_args.get("vggt_model_path")
             or getattr(config, "vggt_model_path", None)
             or os.environ.get("VGGT_MODEL_PATH")
         )
-        requested_vggt_model_repo = (
+        self.config.vggt_model_repo = (
             model_args.get("vggt_model_repo")
             or getattr(config, "vggt_model_repo", None)
             or os.environ.get("VGGT_MODEL_REPO")
             or "facebook/VGGT-1B"
         )
-        requested_vggt_model_url = (
+        self.config.vggt_model_url = (
             model_args.get("vggt_model_url")
             or getattr(config, "vggt_model_url", None)
             or os.environ.get("VGGT_MODEL_URL")
             or "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
         )
-        should_auto_download_vggt = os.environ.get("VGGT_AUTO_DOWNLOAD", "1") == "1"
-        loaded_vggt_weights = False
-        if requested_vggt_model_path:
-            resolved_vggt_model_path = os.path.expanduser(requested_vggt_model_path)
-            if os.path.isfile(resolved_vggt_model_path):
-                vggt_checkpoint = torch.load(resolved_vggt_model_path, map_location="cpu")
-                load_result = _load_vggt_state_dict(self.vggt_model, vggt_checkpoint)
-                logger.info(
-                    "WAYPOINT_FLOW vggt_weights loaded path=%s missing=%d unexpected=%d",
-                    resolved_vggt_model_path,
-                    len(load_result.missing_keys),
-                    len(load_result.unexpected_keys),
-                )
-                if load_result.missing_keys or load_result.unexpected_keys:
-                    logger.warning(
-                        "WAYPOINT_FLOW vggt_weights mismatch missing=%s unexpected=%s",
-                        load_result.missing_keys[:8],
-                        load_result.unexpected_keys[:8],
-                    )
-                self.config.vggt_model_path = resolved_vggt_model_path
-                loaded_vggt_weights = True
-            else:
-                logger.warning(
-                    "WAYPOINT_FLOW vggt_weights path_not_found path=%s",
-                    resolved_vggt_model_path,
-                )
-        if (not loaded_vggt_weights) and should_auto_download_vggt:
-            try:
-                logger.info(
-                    "WAYPOINT_FLOW vggt_weights from_pretrained repo=%s",
-                    requested_vggt_model_repo,
-                )
-                self.vggt_model = VGGT.from_pretrained(
-                    requested_vggt_model_repo,
-                    enable_camera=False,
-                    enable_point=False,
-                    enable_depth=False,
-                    enable_track=False,
-                )
-                logger.info(
-                    "WAYPOINT_FLOW vggt_weights loaded_from_repo repo=%s",
-                    requested_vggt_model_repo,
-                )
-                self.config.vggt_model_repo = requested_vggt_model_repo
-                loaded_vggt_weights = True
-            except Exception as exc:
-                logger.warning(
-                    "WAYPOINT_FLOW vggt_weights from_pretrained_failed repo=%s error=%s",
-                    requested_vggt_model_repo,
-                    exc,
-                )
-        if (not loaded_vggt_weights) and should_auto_download_vggt:
-            try:
-                logger.info(
-                    "WAYPOINT_FLOW vggt_weights downloading_fallback url=%s",
-                    requested_vggt_model_url,
-                )
-                vggt_checkpoint = torch.hub.load_state_dict_from_url(
-                    requested_vggt_model_url,
-                    map_location="cpu",
-                )
-                load_result = _load_vggt_state_dict(self.vggt_model, vggt_checkpoint)
-                logger.info(
-                    "WAYPOINT_FLOW vggt_weights downloaded_fallback missing=%d unexpected=%d",
-                    len(load_result.missing_keys),
-                    len(load_result.unexpected_keys),
-                )
-                if load_result.missing_keys or load_result.unexpected_keys:
-                    logger.warning(
-                        "WAYPOINT_FLOW vggt_weights mismatch missing=%s unexpected=%s",
-                        load_result.missing_keys[:8],
-                        load_result.unexpected_keys[:8],
-                    )
-                self.config.vggt_model_url = requested_vggt_model_url
-                loaded_vggt_weights = True
-            except Exception as exc:
-                logger.warning(
-                    "WAYPOINT_FLOW vggt_weights fallback_failed url=%s error=%s",
-                    requested_vggt_model_url,
-                    exc,
-                )
-        if not loaded_vggt_weights:
-            logger.warning(
-                "WAYPOINT_FLOW vggt_weights unavailable using_random_init=True"
-            )
-        self.vggt_model.eval()
-        for param in self.vggt_model.parameters():
-            param.requires_grad = False
+        self.config.vggt_auto_download = model_args.get("vggt_auto_download", None)
+        self._vggt_weights_loaded = False
+        self._freeze_vggt_model()
             
         # VGGT Latent Token Projector
         # 输入: [B*S, 1024, 16, 16] (假设224分辨率，14 Patch)
@@ -261,6 +176,142 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
     
     def get_special_token_id(self, special_token_dict):
         self.special_token_dict = special_token_dict
+
+    def _freeze_vggt_model(self):
+        self.vggt_model.eval()
+        for param in self.vggt_model.parameters():
+            param.requires_grad = False
+
+    def initialize_vggt_weights(self, force_reload: bool = False):
+        has_meta_params = any(getattr(param, "is_meta", False) for param in self.vggt_model.parameters())
+        if self._vggt_weights_loaded and not force_reload and not has_meta_params:
+            return True
+
+        requested_vggt_model_path = (
+            getattr(self.config, "vggt_model_path", None)
+            or os.environ.get("VGGT_MODEL_PATH")
+        )
+        requested_vggt_model_repo = (
+            getattr(self.config, "vggt_model_repo", None)
+            or os.environ.get("VGGT_MODEL_REPO")
+            or "facebook/VGGT-1B"
+        )
+        requested_vggt_model_url = (
+            getattr(self.config, "vggt_model_url", None)
+            or os.environ.get("VGGT_MODEL_URL")
+            or "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+        )
+        config_auto_download = getattr(self.config, "vggt_auto_download", None)
+        if config_auto_download is None:
+            should_auto_download_vggt = os.environ.get("VGGT_AUTO_DOWNLOAD", "1") == "1"
+        else:
+            should_auto_download_vggt = bool(config_auto_download)
+
+        loaded_vggt_model = None
+
+        if requested_vggt_model_path:
+            resolved_vggt_model_path = os.path.expanduser(requested_vggt_model_path)
+            if os.path.isfile(resolved_vggt_model_path):
+                loaded_vggt_model = VGGT(
+                    enable_camera=False,
+                    enable_point=False,
+                    enable_depth=False,
+                    enable_track=False,
+                )
+                vggt_checkpoint = torch.load(resolved_vggt_model_path, map_location="cpu")
+                load_result = _load_vggt_state_dict(loaded_vggt_model, vggt_checkpoint)
+                logger.info(
+                    "WAYPOINT_FLOW vggt_weights loaded path=%s missing=%d unexpected=%d",
+                    resolved_vggt_model_path,
+                    len(load_result.missing_keys),
+                    len(load_result.unexpected_keys),
+                )
+                if load_result.missing_keys or load_result.unexpected_keys:
+                    logger.warning(
+                        "WAYPOINT_FLOW vggt_weights mismatch missing=%s unexpected=%s",
+                        load_result.missing_keys[:8],
+                        load_result.unexpected_keys[:8],
+                    )
+                self.config.vggt_model_path = resolved_vggt_model_path
+            else:
+                logger.warning(
+                    "WAYPOINT_FLOW vggt_weights path_not_found path=%s",
+                    resolved_vggt_model_path,
+                )
+
+        if loaded_vggt_model is None and should_auto_download_vggt:
+            try:
+                logger.info(
+                    "WAYPOINT_FLOW vggt_weights from_pretrained repo=%s",
+                    requested_vggt_model_repo,
+                )
+                loaded_vggt_model = VGGT.from_pretrained(
+                    requested_vggt_model_repo,
+                    enable_camera=False,
+                    enable_point=False,
+                    enable_depth=False,
+                    enable_track=False,
+                )
+                logger.info(
+                    "WAYPOINT_FLOW vggt_weights loaded_from_repo repo=%s",
+                    requested_vggt_model_repo,
+                )
+                self.config.vggt_model_repo = requested_vggt_model_repo
+            except Exception as exc:
+                logger.warning(
+                    "WAYPOINT_FLOW vggt_weights from_pretrained_failed repo=%s error=%s",
+                    requested_vggt_model_repo,
+                    exc,
+                )
+
+        if loaded_vggt_model is None and should_auto_download_vggt:
+            try:
+                logger.info(
+                    "WAYPOINT_FLOW vggt_weights downloading_fallback url=%s",
+                    requested_vggt_model_url,
+                )
+                loaded_vggt_model = VGGT(
+                    enable_camera=False,
+                    enable_point=False,
+                    enable_depth=False,
+                    enable_track=False,
+                )
+                vggt_checkpoint = torch.hub.load_state_dict_from_url(
+                    requested_vggt_model_url,
+                    map_location="cpu",
+                )
+                load_result = _load_vggt_state_dict(loaded_vggt_model, vggt_checkpoint)
+                logger.info(
+                    "WAYPOINT_FLOW vggt_weights downloaded_fallback missing=%d unexpected=%d",
+                    len(load_result.missing_keys),
+                    len(load_result.unexpected_keys),
+                )
+                if load_result.missing_keys or load_result.unexpected_keys:
+                    logger.warning(
+                        "WAYPOINT_FLOW vggt_weights mismatch missing=%s unexpected=%s",
+                        load_result.missing_keys[:8],
+                        load_result.unexpected_keys[:8],
+                    )
+                self.config.vggt_model_url = requested_vggt_model_url
+            except Exception as exc:
+                logger.warning(
+                    "WAYPOINT_FLOW vggt_weights fallback_failed url=%s error=%s",
+                    requested_vggt_model_url,
+                    exc,
+                )
+
+        if loaded_vggt_model is None:
+            logger.warning(
+                "WAYPOINT_FLOW vggt_weights unavailable using_random_init=True"
+            )
+            self._vggt_weights_loaded = False
+            self._freeze_vggt_model()
+            return False
+
+        self.vggt_model = loaded_vggt_model
+        self._freeze_vggt_model()
+        self._vggt_weights_loaded = True
+        return True
         
     def get_model(self):
         return self.model

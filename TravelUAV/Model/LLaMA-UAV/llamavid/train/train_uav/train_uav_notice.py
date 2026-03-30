@@ -1145,6 +1145,8 @@ def train():
         cache_dir=training_args.cache_dir,
         **bnb_model_from_pretrained_args
     )
+    if hasattr(model, "initialize_vggt_weights"):
+        model.initialize_vggt_weights()
     model.config.use_cache = False
 
     if model_args.freeze_backbone:

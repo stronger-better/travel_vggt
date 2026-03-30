@@ -920,8 +920,11 @@ class LazySupervisedDataset(Dataset):
                 clip_images = clip_images.permute(0, 2, 3, 1).cpu().numpy()
                 vggt_image = preprocess_vggt_images(clip_images).to(dtype=image.dtype)
 
-            history_waypoint = np.asarray(sources[0]['trajectory'][:frame_num, :3], dtype=np.float32)
-            target_point = np.asarray(ori_sources[0]['trajectory'][-1][:3], dtype=np.float32)
+            trajectory = np.asarray(sources[0]['trajectory'], dtype=np.float32)
+            history_waypoint = np.asarray(trajectory[:frame_num, :3], dtype=np.float32)
+            if history_waypoint.shape[0] == 0:
+                history_waypoint = np.asarray(trajectory[:1, :3], dtype=np.float32)
+            target_point = np.asarray(trajectory[-1, :3], dtype=np.float32)
             x, y = float(target_point[0]), float(target_point[1])
             rotation_matrix = rotation_matrix_from_vector(x, y)
             history_waypoint = transform_point(history_waypoint, rotation_matrix)

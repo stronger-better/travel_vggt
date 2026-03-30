@@ -18,8 +18,8 @@ model_dir=$root_dir/Model/LLaMA-UAV
 # Examples:
 #   export VGGT_MODEL_PATH=/path/to/VGGT-1B/model.pt
 #   export FORCE_OFFLINE=1
-VGGT_MODEL_PATH="${VGGT_MODEL_PATH:-}"
-FORCE_OFFLINE="${FORCE_OFFLINE:-0}"
+VGGT_MODEL_PATH=/mnt/sfs_turbo_new/R10844/zhangpeilun/openuav_vggt/TravelUAV/vggt_checkpoints/model.pt
+FORCE_OFFLINE=1
 VGGT_ARGS=()
 
 if [[ -n "$VGGT_MODEL_PATH" ]]; then

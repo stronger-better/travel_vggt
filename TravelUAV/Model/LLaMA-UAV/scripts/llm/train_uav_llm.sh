@@ -12,20 +12,31 @@ export LD_LIBRARY_PATH="${SITE_PACKAGES}/nvidia/cublas/lib:${SITE_PACKAGES}/nvid
 root_dir=/mnt/sfs_turbo_new/R10844/zhangpeilun/openuav_vggt/TravelUAV
 model_dir=$root_dir/Model/LLaMA-UAV
 
-# Offline VGGT settings.
-# Point this to the local VGGT model.pt that already exists on the server.
-VGGT_MODEL_PATH="${VGGT_MODEL_PATH:-/mnt/sfs_turbo_new/R10844/zhangpeilun/models/VGGT-1B/model.pt}"
-if [[ ! -f "$VGGT_MODEL_PATH" ]]; then
-    echo "VGGT model file not found: $VGGT_MODEL_PATH" >&2
-    echo "Please set VGGT_MODEL_PATH to your local VGGT model.pt path." >&2
-    exit 1
+# Optional local VGGT settings.
+# 1. If VGGT_MODEL_PATH is set, the script will load local model.pt.
+# 2. If FORCE_OFFLINE=1, the script will disable Hugging Face network access.
+# Examples:
+#   export VGGT_MODEL_PATH=/path/to/VGGT-1B/model.pt
+#   export FORCE_OFFLINE=1
+VGGT_MODEL_PATH="${VGGT_MODEL_PATH:-}"
+FORCE_OFFLINE="${FORCE_OFFLINE:-0}"
+VGGT_ARGS=()
+
+if [[ -n "$VGGT_MODEL_PATH" ]]; then
+    if [[ ! -f "$VGGT_MODEL_PATH" ]]; then
+        echo "VGGT model file not found: $VGGT_MODEL_PATH" >&2
+        echo "Please set VGGT_MODEL_PATH to a valid local VGGT model.pt path." >&2
+        exit 1
+    fi
+    export VGGT_AUTO_DOWNLOAD=0
+    VGGT_ARGS+=(--vggt_model_path "$VGGT_MODEL_PATH")
 fi
 
-# Force local-only loading and disable Hugging Face network access.
-export VGGT_AUTO_DOWNLOAD=0
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
-export HF_DATASETS_OFFLINE=1
+if [[ "$FORCE_OFFLINE" == "1" ]]; then
+    export HF_HUB_OFFLINE=1
+    export TRANSFORMERS_OFFLINE=1
+    export HF_DATASETS_OFFLINE=1
+fi
 
 # export CUDA_VISIBLE_DEVICES=5
 
@@ -39,7 +50,6 @@ deepspeed \
     --deepspeed $model_dir/scripts/zero2.json \
     --ddp_find_unused_parameters True \
     --model_name_or_path /mnt/sfs_turbo_new/R10844/zhangpeilun/openuav_vggt/TravelUAV/Model/LLaMA-UAV/model_zoo/vicuna-7b-v1.5 \
-    --vggt_model_path "$VGGT_MODEL_PATH" \
     --version imgsp_uav \
     --is_multimodal True \
     --vision_tower /mnt/sfs_turbo_new/R10844/zhangpeilun/openuav_vggt/TravelUAV/Model/LLaMA-UAV/model_zoo/LAVIS/eva_vit_g.pth \
@@ -75,4 +85,5 @@ deepspeed \
     --dataloader_num_workers 4 \
     --lazy_preprocess True \
     --report_to wandb \
-    --lora_enable True
+    --lora_enable True \
+    "${VGGT_ARGS[@]}"

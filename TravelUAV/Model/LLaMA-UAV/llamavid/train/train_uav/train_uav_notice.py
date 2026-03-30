@@ -82,6 +82,7 @@ def waypoint2angle(waypoints):
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
+    vggt_model_path: Optional[str] = field(default=None)
     version: Optional[str] = field(default="v0")
     freeze_backbone: bool = field(default=False)
     tune_mm_mlp_adapter: bool = field(default=False)
@@ -1113,6 +1114,7 @@ def train():
     model = LlavaLlamaAttForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         use_angle_and_norm_loss=model_args.use_angle_and_norm_loss,
+        vggt_model_path=model_args.vggt_model_path,
         config=config,
         cache_dir=training_args.cache_dir,
         **bnb_model_from_pretrained_args

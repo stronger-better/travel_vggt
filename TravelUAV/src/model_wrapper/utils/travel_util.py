@@ -26,7 +26,13 @@ from llamavid import conversation as conversation_lib
 def load_model(args):
     model_path = os.path.expanduser(args.model_path)
     model_name = get_model_name_from_path(model_path)
-    tokenizer, model, image_processor, _ = load_pretrained_model(model_path, args.model_base, model_name)
+    vggt_model_path = getattr(args, "vggt_model_path", None) or os.environ.get("VGGT_MODEL_PATH")
+    tokenizer, model, image_processor, _ = load_pretrained_model(
+        model_path,
+        args.model_base,
+        model_name,
+        vggt_model_path=vggt_model_path,
+    )
     
     smarter_tokenizer_and_embedding_resize(special_tokens_list=['<wp>', '<his>'], tokenizer=tokenizer, model=model)
     model.get_special_token_id({'<wp>': tokenizer.encode('<wp>')[1], '<his>': tokenizer.encode('<his>')[1],

@@ -12,6 +12,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+import os
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -27,6 +28,36 @@ from llamavid.model.language_model.llama_uav import LlamaUAVModel, LlamaUAVForCa
 from llamavid.constants import WAYPOINT_LABEL_TOKEN
 
 from vggt.models.vggt import VGGT
+
+try:
+    from utils.logger import logger
+except Exception:  # pragma: no cover - fallback for standalone model imports
+    import logging
+    logger = logging.getLogger(__name__)
+
+
+def _extract_checkpoint_state_dict(checkpoint):
+    if isinstance(checkpoint, dict):
+        for key in ("model", "state_dict", "module", "weights"):
+            maybe_state_dict = checkpoint.get(key)
+            if isinstance(maybe_state_dict, dict):
+                return maybe_state_dict
+    return checkpoint
+
+
+def _strip_state_dict_prefix(state_dict, prefix):
+    if not isinstance(state_dict, dict) or not state_dict:
+        return state_dict
+    if all(key.startswith(prefix) for key in state_dict.keys()):
+        return {key[len(prefix):]: value for key, value in state_dict.items()}
+    return state_dict
+
+
+def _load_vggt_state_dict(vggt_model, checkpoint_or_state_dict):
+    vggt_state_dict = _extract_checkpoint_state_dict(checkpoint_or_state_dict)
+    vggt_state_dict = _strip_state_dict_prefix(vggt_state_dict, "module.")
+    vggt_state_dict = _strip_state_dict_prefix(vggt_state_dict, "model.")
+    return vggt_model.load_state_dict(vggt_state_dict, strict=False)
 
 class LlavaConfig(LlamaConfig):
     model_type = "llava"
@@ -84,6 +115,77 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
             enable_depth=False, 
             enable_track=False
         )
+        requested_vggt_model_path = (
+            model_args.get("vggt_model_path")
+            or getattr(config, "vggt_model_path", None)
+            or os.environ.get("VGGT_MODEL_PATH")
+        )
+        requested_vggt_model_url = (
+            model_args.get("vggt_model_url")
+            or getattr(config, "vggt_model_url", None)
+            or os.environ.get("VGGT_MODEL_URL")
+            or "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+        )
+        should_auto_download_vggt = os.environ.get("VGGT_AUTO_DOWNLOAD", "1") == "1"
+        loaded_vggt_weights = False
+        if requested_vggt_model_path:
+            resolved_vggt_model_path = os.path.expanduser(requested_vggt_model_path)
+            if os.path.isfile(resolved_vggt_model_path):
+                vggt_checkpoint = torch.load(resolved_vggt_model_path, map_location="cpu")
+                load_result = _load_vggt_state_dict(self.vggt_model, vggt_checkpoint)
+                logger.info(
+                    "WAYPOINT_FLOW vggt_weights loaded path=%s missing=%d unexpected=%d",
+                    resolved_vggt_model_path,
+                    len(load_result.missing_keys),
+                    len(load_result.unexpected_keys),
+                )
+                if load_result.missing_keys or load_result.unexpected_keys:
+                    logger.warning(
+                        "WAYPOINT_FLOW vggt_weights mismatch missing=%s unexpected=%s",
+                        load_result.missing_keys[:8],
+                        load_result.unexpected_keys[:8],
+                    )
+                self.config.vggt_model_path = resolved_vggt_model_path
+                loaded_vggt_weights = True
+            else:
+                logger.warning(
+                    "WAYPOINT_FLOW vggt_weights path_not_found path=%s",
+                    resolved_vggt_model_path,
+                )
+        if (not loaded_vggt_weights) and should_auto_download_vggt:
+            try:
+                logger.info(
+                    "WAYPOINT_FLOW vggt_weights downloading url=%s",
+                    requested_vggt_model_url,
+                )
+                vggt_checkpoint = torch.hub.load_state_dict_from_url(
+                    requested_vggt_model_url,
+                    map_location="cpu",
+                )
+                load_result = _load_vggt_state_dict(self.vggt_model, vggt_checkpoint)
+                logger.info(
+                    "WAYPOINT_FLOW vggt_weights downloaded missing=%d unexpected=%d",
+                    len(load_result.missing_keys),
+                    len(load_result.unexpected_keys),
+                )
+                if load_result.missing_keys or load_result.unexpected_keys:
+                    logger.warning(
+                        "WAYPOINT_FLOW vggt_weights mismatch missing=%s unexpected=%s",
+                        load_result.missing_keys[:8],
+                        load_result.unexpected_keys[:8],
+                    )
+                self.config.vggt_model_url = requested_vggt_model_url
+                loaded_vggt_weights = True
+            except Exception as exc:
+                logger.warning(
+                    "WAYPOINT_FLOW vggt_weights download_failed url=%s error=%s",
+                    requested_vggt_model_url,
+                    exc,
+                )
+        if not loaded_vggt_weights:
+            logger.warning(
+                "WAYPOINT_FLOW vggt_weights unavailable using_random_init=True"
+            )
         self.vggt_model.eval()
         for param in self.vggt_model.parameters():
             param.requires_grad = False
@@ -153,7 +255,7 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
                 input_ids = input_ids.to(device=self.device)
             if attention_mask.device != self.device:
                 attention_mask = attention_mask.to(device=self.device)
-            if labels.device != self.device:
+            if labels is not None and labels.device != self.device:
                 labels = labels.to(device=self.device)
             
             # [修改点 1] 移动 device 的逻辑补齐
@@ -168,7 +270,7 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
             
         # [修改点 2] 补全 vggt_images 的数据精度转换 (半精度 fp16/bf16 对齐)
         if vggt_images is not None:
-            vggt_images = vggt_images.to(dtype=self.dtype)
+            vggt_images = vggt_images.to(device=self.device, dtype=torch.float32)
         
         history_embeds = []
         

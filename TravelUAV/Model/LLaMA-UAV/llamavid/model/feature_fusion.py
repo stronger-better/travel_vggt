@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from safetensors.torch import load_file as safe_load_file
 
 from vggt.models.vggt import VGGT
@@ -91,6 +92,16 @@ def _load_local_vggt_checkpoint(vggt_model: nn.Module, checkpoint_path: str):
     _load_vggt_state_dict(vggt_model, checkpoint, checkpoint_path)
 
 
+def _load_vggt_from_pretrained(model_path: str):
+    return VGGT.from_pretrained(
+        model_path,
+        enable_camera=False,
+        enable_point=False,
+        enable_depth=False,
+        enable_track=False,
+    )
+
+
 @dataclass
 class FeatureFusionConfig:
     fusion_method: str = "gated"
@@ -115,9 +126,6 @@ class VGGTGeometryEncoder(nn.Module):
         self.vggt_auto_download = vggt_auto_download
         self._weights_initialized = False
         self.vggt = VGGT(
-            img_size=224,
-            patch_size=14,
-            embed_dim=1024,
             enable_camera=False,
             enable_point=False,
             enable_depth=False,
@@ -146,25 +154,28 @@ class VGGTGeometryEncoder(nn.Module):
         loaded_from = None
 
         if self.vggt_model_path:
-            local_checkpoint_path = _resolve_vggt_checkpoint_path(self.vggt_model_path)
-            if local_checkpoint_path is None:
-                logger.warning("VGGT checkpoint not found at %s, falling back to download.", self.vggt_model_path)
-            else:
+            local_model_path = os.path.expanduser(self.vggt_model_path)
+            if os.path.isdir(local_model_path):
                 try:
-                    _load_local_vggt_checkpoint(self.vggt, local_checkpoint_path)
-                    loaded_from = local_checkpoint_path
+                    self.vggt = _load_vggt_from_pretrained(local_model_path)
+                    loaded_from = local_model_path
                 except Exception as exc:
-                    logger.warning("Failed to load local VGGT checkpoint %s: %s", local_checkpoint_path, exc)
+                    logger.warning("Failed to load VGGT model from local directory %s: %s", local_model_path, exc)
+
+            if loaded_from is None:
+                local_checkpoint_path = _resolve_vggt_checkpoint_path(self.vggt_model_path)
+                if local_checkpoint_path is None:
+                    logger.warning("VGGT checkpoint not found at %s, falling back to download.", self.vggt_model_path)
+                else:
+                    try:
+                        _load_local_vggt_checkpoint(self.vggt, local_checkpoint_path)
+                        loaded_from = local_checkpoint_path
+                    except Exception as exc:
+                        logger.warning("Failed to load local VGGT checkpoint %s: %s", local_checkpoint_path, exc)
 
         if loaded_from is None and self.vggt_auto_download and self.vggt_model_repo:
             try:
-                pretrained_model = VGGT.from_pretrained(
-                    self.vggt_model_repo,
-                    enable_camera=False,
-                    enable_point=False,
-                    enable_depth=False,
-                    enable_track=False,
-                )
+                pretrained_model = _load_vggt_from_pretrained(self.vggt_model_repo)
                 self.vggt.load_state_dict(pretrained_model.state_dict(), strict=False)
                 loaded_from = self.vggt_model_repo
             except Exception as exc:
@@ -347,15 +358,7 @@ class GeometryFeatureMerger(nn.Module):
 
     def forward(self, x: torch.Tensor, target_hw=None):
         n_image, h_patch, w_patch, dim = x.shape
-
         merge_size = self.merge_size
-        if target_hw is not None:
-            target_h, target_w = target_hw
-            if target_h > 0 and target_w > 0:
-                merge_h = max(1, h_patch // target_h)
-                merge_w = max(1, w_patch // target_w)
-                if merge_h == merge_w and merge_h > 0:
-                    merge_size = merge_h
 
         h_valid = (h_patch // merge_size) * merge_size
         w_valid = (w_patch // merge_size) * merge_size
@@ -364,10 +367,6 @@ class GeometryFeatureMerger(nn.Module):
         x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
 
         if self.merger_type == "mlp":
-            if merge_size != self.merge_size:
-                raise ValueError(
-                    f"GeometryFeatureMerger merge_size mismatch: expected {self.merge_size}, got {merge_size}"
-                )
             x_flat = self.norm(x).view(-1, self.input_dim)
             x_flat = self.mlp(x_flat)
         else:
@@ -376,4 +375,13 @@ class GeometryFeatureMerger(nn.Module):
             x_flat = self.mlp(x_flat)
 
         x = x_flat.reshape(n_image, h_valid // merge_size, w_valid // merge_size, -1)
+        if target_hw is not None and (x.shape[1] != target_hw[0] or x.shape[2] != target_hw[1]):
+            x = x.permute(0, 3, 1, 2)
+            x = F.interpolate(
+                x,
+                size=target_hw,
+                mode="bilinear",
+                align_corners=False,
+            )
+            x = x.permute(0, 2, 3, 1)
         return x

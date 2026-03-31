@@ -187,10 +187,16 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
             return current_image_feature
 
         geometry_grid = geometry_tokens.reshape(n_image, geo_side, geo_side, -1)
-        if geo_side // vis_side != self.geometry_merge_size:
-            return current_image_feature
-
         merged_geometry = self.geometry_merger(geometry_grid, target_hw=(vis_side, vis_side))
+        if merged_geometry.shape[1] != vis_side or merged_geometry.shape[2] != vis_side:
+            merged_geometry = merged_geometry.permute(0, 3, 1, 2)
+            merged_geometry = F.interpolate(
+                merged_geometry,
+                size=(vis_side, vis_side),
+                mode="bilinear",
+                align_corners=False,
+            )
+            merged_geometry = merged_geometry.permute(0, 2, 3, 1)
         vis_grid = vis_tokens.reshape(n_image, vis_side, vis_side, -1)
         fused_vis_grid = self.feature_fusion(vis_grid, merged_geometry)
         fused_vis_tokens = fused_vis_grid.reshape(n_image, vis_side * vis_side, -1)

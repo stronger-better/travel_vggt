@@ -11,6 +11,12 @@ SITE_PACKAGES="/mnt/sfs_turbo/R10840/anaconda3/envs/travel_vggt/lib/python3.10/s
 export LD_LIBRARY_PATH="${SITE_PACKAGES}/nvidia/cublas/lib:${SITE_PACKAGES}/nvidia/nccl/lib:${SITE_PACKAGES}/nvidia/cudnn/lib:$LD_LIBRARY_PATH"
 root_dir=/mnt/sfs_turbo_new/R10844/zhangpeilun/openuav_vggt/TravelUAV # TravelUAV directory
 model_dir=$root_dir/Model/LLaMA-UAV
+vggt_model_path=${VGGT_MODEL_PATH:-""}
+
+extra_args=()
+if [ -n "$vggt_model_path" ]; then
+    extra_args+=(--vggt_model_path "$vggt_model_path")
+fi
 
 # 设置CUDA设备
 # export CUDA_VISIBLE_DEVICES=5
@@ -61,3 +67,4 @@ deepspeed \
     --lazy_preprocess True \
     --report_to wandb \
     --lora_enable True \
+    "${extra_args[@]}"

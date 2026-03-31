@@ -10,6 +10,7 @@ from scipy.spatial.transform import Rotation as R
 import torch
 import numpy as np
 import math
+from PIL import Image
 
 
 sys.path.append(str(Path(str(os.getcwd())).resolve()))
@@ -23,6 +24,100 @@ from llamavid.constants import (
     WAYPOINT_INPUT_TOKEN, WAYPOINT_LABEL_TOKEN, DEFAULT_HISTORY_TOKEN, DEFAULT_WP_TOKEN
 )
 from llamavid import conversation as conversation_lib
+
+
+def preprocess_vggt_images(images, mode="crop"):
+    if len(images) == 0:
+        raise ValueError("At least 1 image is required")
+    if mode not in ["crop", "pad"]:
+        raise ValueError("Mode must be either 'crop' or 'pad'")
+
+    processed = []
+    shapes = set()
+    target_size = 518
+
+    for image in images:
+        if isinstance(image, Image.Image):
+            img = image
+        else:
+            image_np = np.asarray(image)
+            if image_np.dtype != np.uint8:
+                if np.issubdtype(image_np.dtype, np.floating):
+                    max_val = float(np.nanmax(image_np)) if image_np.size > 0 else 0.0
+                    if max_val <= 1.0 + 1e-6:
+                        image_np = np.clip(image_np * 255.0, 0.0, 255.0).astype(np.uint8)
+                    else:
+                        image_np = np.clip(image_np, 0.0, 255.0).astype(np.uint8)
+                else:
+                    image_np = np.clip(image_np, 0, 255).astype(np.uint8)
+            img = Image.fromarray(image_np)
+
+        if img.mode == "RGBA":
+            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
+            img = Image.alpha_composite(background, img)
+        img = img.convert("RGB")
+        width, height = img.size
+
+        if mode == "pad":
+            if width >= height:
+                new_width = target_size
+                new_height = round(height * (new_width / width) / 14) * 14
+            else:
+                new_height = target_size
+                new_width = round(width * (new_height / height) / 14) * 14
+        else:
+            new_width = target_size
+            new_height = round(height * (new_width / width) / 14) * 14
+
+        img = img.resize((new_width, new_height), Image.Resampling.BICUBIC)
+        img = torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0).permute(2, 0, 1)
+
+        if mode == "crop" and new_height > target_size:
+            start_y = (new_height - target_size) // 2
+            img = img[:, start_y : start_y + target_size, :]
+
+        if mode == "pad":
+            h_padding = target_size - img.shape[1]
+            w_padding = target_size - img.shape[2]
+            if h_padding > 0 or w_padding > 0:
+                pad_top = h_padding // 2
+                pad_bottom = h_padding - pad_top
+                pad_left = w_padding // 2
+                pad_right = w_padding - pad_left
+                img = torch.nn.functional.pad(
+                    img,
+                    (pad_left, pad_right, pad_top, pad_bottom),
+                    mode="constant",
+                    value=1.0,
+                )
+
+        shapes.add((img.shape[1], img.shape[2]))
+        processed.append(img)
+
+    if len(shapes) > 1:
+        max_height = max(shape[0] for shape in shapes)
+        max_width = max(shape[1] for shape in shapes)
+        padded_images = []
+        for img in processed:
+            h_padding = max_height - img.shape[1]
+            w_padding = max_width - img.shape[2]
+            if h_padding > 0 or w_padding > 0:
+                pad_top = h_padding // 2
+                pad_bottom = h_padding - pad_top
+                pad_left = w_padding // 2
+                pad_right = w_padding - pad_left
+                img = torch.nn.functional.pad(
+                    img,
+                    (pad_left, pad_right, pad_top, pad_bottom),
+                    mode="constant",
+                    value=1.0,
+                )
+            padded_images.append(img)
+        processed = padded_images
+
+    return torch.stack(processed, dim=0)
+
+
 def load_model(args):
     model_path = os.path.expanduser(args.model_path)
     model_name = get_model_name_from_path(model_path)
@@ -256,14 +351,9 @@ def prepare_data_to_inputs(episodes, tokenizer, image_processor, data_args, targ
     images = np.stack(images, axis=0)
     image = processor.preprocess(images, return_tensors='pt')['pixel_values']
 
-    # ==========================================
-    # [新增] 构建用于 VGGT 的 vggt_image (与训练严格对齐)
-    # ==========================================
-    # 使用 CLIP 的均值和方差进行反归一化，将像素值限制在 [0, 1]
-    CLIP_MEAN = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1).to(image.device)
-    CLIP_STD = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1).to(image.device)
-    vggt_image = torch.clamp(image * CLIP_STD + CLIP_MEAN, 0.0, 1.0)
-    # ==========================================
+    # VGGT 官方默认 quick-start 预处理是 load_and_preprocess_images(..., mode="crop")
+    # 这里做同样的内存版变换，直接从原始 RGB 构建 0-1 输入，而不是从 CLIP tensor 反归一化。
+    vggt_image = preprocess_vggt_images(images, mode="crop")
 
     conversation_for_human = '<image>\n' + sources[-1]['instruction']
     conversation = [
@@ -319,6 +409,7 @@ def prepare_data_to_inputs(episodes, tokenizer, image_processor, data_args, targ
                         labels=data_dict["labels"][0])
 
     data_dict['image'] = image
+    data_dict['vggt_image'] = vggt_image
     data_dict['history_waypoint'] = torch.tensor(history_waypoint).view(-1)
     ori_0 = ori_sources[0]['sensors']['state']
     ori = ori_sources[-1]['sensors']['state']

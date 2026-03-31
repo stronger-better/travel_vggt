@@ -50,10 +50,98 @@ from decord import VideoReader, cpu
 local_rank = None
 
 # ==========================================
-# [新增] 定义 CLIP 归一化参数，用于反归一化还原
+# VGGT preprocessing helper aligned with inference.
 # ==========================================
-CLIP_MEAN = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(1, 3, 1, 1)
-CLIP_STD = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(1, 3, 1, 1)
+def preprocess_vggt_images(images, mode="crop"):
+    if len(images) == 0:
+        raise ValueError("At least 1 image is required")
+    if mode not in ["crop", "pad"]:
+        raise ValueError("Mode must be either 'crop' or 'pad'")
+
+    processed = []
+    shapes = set()
+    target_size = 518
+
+    for image in images:
+        if isinstance(image, Image.Image):
+            img = image
+        else:
+            image_np = np.asarray(image)
+            if image_np.dtype != np.uint8:
+                if np.issubdtype(image_np.dtype, np.floating):
+                    max_val = float(np.nanmax(image_np)) if image_np.size > 0 else 0.0
+                    if max_val <= 1.0 + 1e-6:
+                        image_np = np.clip(image_np * 255.0, 0.0, 255.0).astype(np.uint8)
+                    else:
+                        image_np = np.clip(image_np, 0.0, 255.0).astype(np.uint8)
+                else:
+                    image_np = np.clip(image_np, 0, 255).astype(np.uint8)
+            img = Image.fromarray(image_np)
+
+        if img.mode == "RGBA":
+            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
+            img = Image.alpha_composite(background, img)
+        img = img.convert("RGB")
+
+        width, height = img.size
+        if mode == "pad":
+            if width >= height:
+                new_width = target_size
+                new_height = round(height * (new_width / width) / 14) * 14
+            else:
+                new_height = target_size
+                new_width = round(width * (new_height / height) / 14) * 14
+        else:
+            new_width = target_size
+            new_height = round(height * (new_width / width) / 14) * 14
+
+        img = img.resize((new_width, new_height), Image.Resampling.BICUBIC)
+        img = torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0).permute(2, 0, 1)
+
+        if mode == "crop" and new_height > target_size:
+            start_y = (new_height - target_size) // 2
+            img = img[:, start_y : start_y + target_size, :]
+
+        if mode == "pad":
+            h_padding = target_size - img.shape[1]
+            w_padding = target_size - img.shape[2]
+            if h_padding > 0 or w_padding > 0:
+                pad_top = h_padding // 2
+                pad_bottom = h_padding - pad_top
+                pad_left = w_padding // 2
+                pad_right = w_padding - pad_left
+                img = torch.nn.functional.pad(
+                    img,
+                    (pad_left, pad_right, pad_top, pad_bottom),
+                    mode="constant",
+                    value=1.0,
+                )
+
+        shapes.add((img.shape[1], img.shape[2]))
+        processed.append(img)
+
+    if len(shapes) > 1:
+        max_height = max(shape[0] for shape in shapes)
+        max_width = max(shape[1] for shape in shapes)
+        padded_images = []
+        for img in processed:
+            h_padding = max_height - img.shape[1]
+            w_padding = max_width - img.shape[2]
+            if h_padding > 0 or w_padding > 0:
+                pad_top = h_padding // 2
+                pad_bottom = h_padding - pad_top
+                pad_left = w_padding // 2
+                pad_right = w_padding - pad_left
+                img = torch.nn.functional.pad(
+                    img,
+                    (pad_left, pad_right, pad_top, pad_bottom),
+                    mode="constant",
+                    value=1.0,
+                )
+            padded_images.append(img)
+        processed = padded_images
+
+    return torch.stack(processed, dim=0)
 
 def rank0_print(*args):
     if local_rank == 0:
@@ -827,13 +915,24 @@ class LazySupervisedDataset(Dataset):
             images_npy_path = os.path.join(traj_dir, 'rgb_imgs.tensor')
             image = torch.load(images_npy_path)[(frame_num-1)*5:frame_num*5]
 
-            # ==========================================
-            # [新增] VGGT 原始图像反归一化恢复
-            # ==========================================
-            mean = CLIP_MEAN.to(image.device, dtype=image.dtype)
-            std = CLIP_STD.to(image.device, dtype=image.dtype)
-            # 还原至 [0, 1] 范围，clamp 防止浮点误差导致越界
-            vggt_image = torch.clamp(image * std + mean, 0.0, 1.0)
+            # Use the raw multi-view RGB frames directly so training matches inference.
+            index_list = sources[0].get('index', [])
+            if len(index_list) < frame_num:
+                raise ValueError(
+                    f"Missing frame index for VGGT preprocessing: frame_num={frame_num}, len(index)={len(index_list)}"
+                )
+            real_index = index_list[frame_num - 1]
+            rgb_paths = [
+                os.path.join(traj_dir, name, str(real_index).zfill(6) + '.png')
+                for name in self.__class__.RGB_FOLDER
+            ]
+            missing_rgb_paths = [path for path in rgb_paths if not os.path.isfile(path)]
+            if missing_rgb_paths:
+                raise FileNotFoundError(
+                    f"Missing raw RGB images required for VGGT preprocessing: {missing_rgb_paths}"
+                )
+            current_rgb_images = [Image.open(img_file).convert('RGB') for img_file in rgb_paths]
+            vggt_image = preprocess_vggt_images(current_rgb_images, mode="crop")
 
             stage, future_delta, assist = self.get_stage(sources[0]['trajectory'], frame_num)
 
@@ -1119,6 +1218,8 @@ def train():
         cache_dir=training_args.cache_dir,
         **bnb_model_from_pretrained_args
     )
+    if hasattr(model, "initialize_vggt_weights"):
+        model.initialize_vggt_weights()
     model.config.use_cache = False
 
     if model_args.freeze_backbone:

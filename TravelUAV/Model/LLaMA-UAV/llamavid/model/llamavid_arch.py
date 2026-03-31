@@ -518,16 +518,26 @@ class LLaMAVIDMetaForCausalLM(ABC):
             with torch.no_grad():
                 vggt_model = vggt_model.to(device=self.device, dtype=torch.float32)
                 vggt_model.eval()
-                # 【关键防护】将 5D 张量展平为 4D
-                if vggt_images.dim() == 5:
-                    B_v, S_v, C_v, H_v, W_v = vggt_images.shape
-                    vggt_images_input = vggt_images.view(B_v * S_v, C_v, H_v, W_v)
-                else:
-                    vggt_images_input = vggt_images
-                vggt_images_input = vggt_images_input.to(device=self.device, dtype=torch.float32)
+                vggt_images_input = vggt_images.to(device=self.device, dtype=torch.float32)
+                original_vggt_shape = tuple(vggt_images_input.shape)
                 vggt_outputs = vggt_model(vggt_images_input)
                 latent_tokens = vggt_outputs['latent_tokens'].to(self.dtype)
-                
+
+            if latent_tokens.dim() == 3:
+                latent_tokens = latent_tokens.unsqueeze(0)
+            elif latent_tokens.dim() == 4 and len(original_vggt_shape) == 5:
+                expected_b, expected_s = original_vggt_shape[0], original_vggt_shape[1]
+                if latent_tokens.shape[0] == 1 and latent_tokens.shape[1] == expected_b * expected_s:
+                    latent_tokens = latent_tokens.view(
+                        expected_b,
+                        expected_s,
+                        latent_tokens.shape[2],
+                        latent_tokens.shape[3],
+                    )
+
+            if latent_tokens.dim() != 4:
+                raise ValueError(f"Unexpected VGGT latent_tokens shape: {tuple(latent_tokens.shape)}")
+
             B, S, N, C = latent_tokens.shape
             Grid_Size = int(N ** 0.5) 
             

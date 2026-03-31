@@ -59,6 +59,154 @@ def rank0_print(*args):
     if local_rank == 0:
         print(*args)
 
+
+VGGT_TARGET_SIZE = 518
+VGGT_PATCH_SIZE = 14
+
+
+def _ensure_rgb_pil_image(image):
+    if isinstance(image, Image.Image):
+        pil_image = image.copy()
+    elif isinstance(image, torch.Tensor):
+        array = image.detach().cpu().numpy()
+        if array.ndim != 3:
+            raise ValueError(f"Expected 3D tensor for image, got shape {tuple(image.shape)}")
+        if array.shape[0] in (1, 3, 4) and array.shape[-1] not in (1, 3, 4):
+            array = np.transpose(array, (1, 2, 0))
+        if array.dtype != np.uint8:
+            max_value = float(array.max()) if array.size > 0 else 0.0
+            if max_value <= 1.0:
+                array = np.clip(array * 255.0, 0, 255).astype(np.uint8)
+            else:
+                array = np.clip(array, 0, 255).astype(np.uint8)
+        pil_image = Image.fromarray(array)
+    else:
+        array = np.asarray(image)
+        if array.ndim != 3:
+            raise ValueError(f"Expected 3D array for image, got shape {array.shape}")
+        if array.shape[0] in (1, 3, 4) and array.shape[-1] not in (1, 3, 4):
+            array = np.transpose(array, (1, 2, 0))
+        if array.dtype != np.uint8:
+            max_value = float(array.max()) if array.size > 0 else 0.0
+            if max_value <= 1.0:
+                array = np.clip(array * 255.0, 0, 255).astype(np.uint8)
+            else:
+                array = np.clip(array, 0, 255).astype(np.uint8)
+        pil_image = Image.fromarray(array)
+
+    if pil_image.mode == "RGBA":
+        background = Image.new("RGBA", pil_image.size, (255, 255, 255, 255))
+        pil_image = Image.alpha_composite(background, pil_image)
+
+    return pil_image.convert("RGB")
+
+
+def preprocess_vggt_rgb_images(images, mode="crop"):
+    if len(images) == 0:
+        raise ValueError("At least 1 image is required for VGGT preprocessing.")
+    if mode not in ("crop", "pad"):
+        raise ValueError(f"Unsupported VGGT preprocess mode: {mode}")
+
+    processed_images = []
+    shapes = set()
+
+    for image in images:
+        pil_image = _ensure_rgb_pil_image(image)
+        width, height = pil_image.size
+
+        if mode == "pad":
+            if width >= height:
+                new_width = VGGT_TARGET_SIZE
+                new_height = max(
+                    VGGT_PATCH_SIZE,
+                    round(height * (new_width / width) / VGGT_PATCH_SIZE) * VGGT_PATCH_SIZE,
+                )
+            else:
+                new_height = VGGT_TARGET_SIZE
+                new_width = max(
+                    VGGT_PATCH_SIZE,
+                    round(width * (new_height / height) / VGGT_PATCH_SIZE) * VGGT_PATCH_SIZE,
+                )
+        else:
+            new_width = VGGT_TARGET_SIZE
+            new_height = max(
+                VGGT_PATCH_SIZE,
+                round(height * (new_width / width) / VGGT_PATCH_SIZE) * VGGT_PATCH_SIZE,
+            )
+
+        pil_image = pil_image.resize((new_width, new_height), Image.Resampling.BICUBIC)
+        image_tensor = torch.from_numpy(np.asarray(pil_image, dtype=np.float32)).permute(2, 0, 1) / 255.0
+
+        if mode == "crop" and new_height > VGGT_TARGET_SIZE:
+            start_y = (new_height - VGGT_TARGET_SIZE) // 2
+            image_tensor = image_tensor[:, start_y : start_y + VGGT_TARGET_SIZE, :]
+
+        if mode == "pad":
+            h_padding = VGGT_TARGET_SIZE - image_tensor.shape[1]
+            w_padding = VGGT_TARGET_SIZE - image_tensor.shape[2]
+            if h_padding > 0 or w_padding > 0:
+                pad_top = h_padding // 2
+                pad_bottom = h_padding - pad_top
+                pad_left = w_padding // 2
+                pad_right = w_padding - pad_left
+                image_tensor = torch.nn.functional.pad(
+                    image_tensor,
+                    (pad_left, pad_right, pad_top, pad_bottom),
+                    mode="constant",
+                    value=1.0,
+                )
+
+        shapes.add((image_tensor.shape[1], image_tensor.shape[2]))
+        processed_images.append(image_tensor)
+
+    if len(shapes) > 1:
+        max_height = max(shape[0] for shape in shapes)
+        max_width = max(shape[1] for shape in shapes)
+        padded_images = []
+        for image_tensor in processed_images:
+            h_padding = max_height - image_tensor.shape[1]
+            w_padding = max_width - image_tensor.shape[2]
+            if h_padding > 0 or w_padding > 0:
+                pad_top = h_padding // 2
+                pad_bottom = h_padding - pad_top
+                pad_left = w_padding // 2
+                pad_right = w_padding - pad_left
+                image_tensor = torch.nn.functional.pad(
+                    image_tensor,
+                    (pad_left, pad_right, pad_top, pad_bottom),
+                    mode="constant",
+                    value=1.0,
+                )
+            padded_images.append(image_tensor)
+        processed_images = padded_images
+
+    return torch.stack(processed_images)
+
+
+def _resolve_rgb_image_path(traj_dir: str, camera_name: str, frame_index) -> str:
+    frame_stem = os.path.splitext(str(frame_index))[0]
+    candidate_names = [frame_stem]
+    if frame_stem.isdigit():
+        candidate_names.append(frame_stem.zfill(6))
+
+    for candidate_name in dict.fromkeys(candidate_names):
+        for extension in (".png", ".jpg", ".jpeg"):
+            image_path = os.path.join(traj_dir, camera_name, candidate_name + extension)
+            if os.path.exists(image_path):
+                return image_path
+
+    raise FileNotFoundError(
+        f"Unable to find raw RGB image for camera={camera_name}, frame_index={frame_index} in {traj_dir}"
+    )
+
+
+def load_and_preprocess_vggt_images_from_paths(image_paths, mode="crop"):
+    rgb_images = []
+    for image_path in image_paths:
+        with Image.open(image_path) as image:
+            rgb_images.append(image.copy())
+    return preprocess_vggt_rgb_images(rgb_images, mode=mode)
+
 def rotation_matrix_from_vector(x, y):
     v_x = np.array([x, y, 0])
     v_x = v_x / np.linalg.norm(v_x)
@@ -844,6 +992,13 @@ class LazySupervisedDataset(Dataset):
             std = CLIP_STD.to(image.device, dtype=image.dtype)
             # 还原至 [0, 1] 范围，clamp 防止浮点误差导致越界
             vggt_image = torch.clamp(image * std + mean, 0.0, 1.0)
+            # Use raw multi-view RGB with VGGT-style resize/crop; this overrides the legacy CLIP inversion path.
+            current_frame_index = sources[0]['index'][frame_num - 1] if 'index' in sources[0] else (frame_num - 1)
+            raw_rgb_paths = [
+                _resolve_rgb_image_path(traj_dir, camera_name, current_frame_index)
+                for camera_name in self.__class__.RGB_FOLDER
+            ]
+            vggt_image = load_and_preprocess_vggt_images_from_paths(raw_rgb_paths, mode="crop")
 
             stage, future_delta, assist = self.get_stage(sources[0]['trajectory'], frame_num)
 

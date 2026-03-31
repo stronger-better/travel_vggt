@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 from dataclasses import dataclass
 
@@ -233,14 +234,74 @@ class CrossAttentionBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, features_2d: torch.Tensor, features_3d: torch.Tensor) -> torch.Tensor:
-        query = self.norm1_query(features_2d)
-        key = self.norm1_key(features_3d)
-        value = self.norm1_value(features_3d)
+    @staticmethod
+    def _get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: torch.Tensor) -> torch.Tensor:
+        if embed_dim % 2 != 0:
+            raise ValueError(f"embed_dim must be even, got {embed_dim}")
+
+        omega = torch.arange(embed_dim // 2, dtype=torch.float32, device=pos.device)
+        omega /= embed_dim / 2.0
+        omega = 1.0 / (10000 ** omega)
+
+        pos = pos.reshape(-1)
+        out = torch.einsum("m,d->md", pos, omega)
+        return torch.cat([torch.sin(out), torch.cos(out)], dim=1)
+
+    def _get_2d_sincos_pos_embed(
+        self,
+        height: int,
+        width: int,
+        embed_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if embed_dim % 2 != 0:
+            raise ValueError(f"embed_dim must be even, got {embed_dim}")
+
+        grid_h = torch.arange(height, dtype=torch.float32, device=device)
+        grid_w = torch.arange(width, dtype=torch.float32, device=device)
+        grid = torch.meshgrid(grid_h, grid_w, indexing="ij")
+        emb_h = self._get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])
+        emb_w = self._get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])
+        return torch.cat([emb_h, emb_w], dim=1).to(dtype=dtype)
+
+    def forward(
+        self,
+        features_2d: torch.Tensor,
+        features_3d: torch.Tensor,
+        h_grid: int,
+        w_grid: int,
+    ) -> torch.Tensor:
+        reshape_to_grid = features_2d.dim() == 4
+
+        if reshape_to_grid:
+            batch_size, _, _, hidden_size = features_2d.shape
+            features_2d_seq = features_2d.reshape(batch_size, h_grid * w_grid, hidden_size)
+            features_3d_seq = features_3d.reshape(batch_size, h_grid * w_grid, hidden_size)
+        else:
+            features_2d_seq = features_2d
+            features_3d_seq = features_3d
+
+        query = self.norm1_query(features_2d_seq)
+        key = self.norm1_key(features_3d_seq)
+        value = self.norm1_value(features_3d_seq)
+        pos_embed = self._get_2d_sincos_pos_embed(
+            h_grid,
+            w_grid,
+            self.hidden_size,
+            query.device,
+            query.dtype,
+        ).unsqueeze(0)
+
+        query = query + pos_embed
+        key = key + pos_embed
         attn_output, _ = self.cross_attention(query, key, value)
-        x = features_2d + attn_output
-        x = x + self.mlp(self.norm2(x))
-        return x
+        fused = features_2d_seq + attn_output
+        fused = fused + self.mlp(self.norm2(fused))
+
+        if reshape_to_grid:
+            return fused.reshape(batch_size, h_grid, w_grid, hidden_size)
+        return fused
 
 
 class FeatureFusionModule(nn.Module):
@@ -276,50 +337,69 @@ class FeatureFusionModule(nn.Module):
             self.weight_2d = nn.Parameter(torch.tensor(0.0))
             self.weight_3d = nn.Parameter(torch.tensor(1.0))
 
-    def forward(self, features_2d: torch.Tensor, features_3d: torch.Tensor) -> torch.Tensor:
-        if features_2d.dim() == 4:
-            b, h, w, _ = features_2d.shape
-            features_2d_seq = features_2d.reshape(b, h * w, -1)
-        else:
-            b = features_2d.shape[0]
-            features_2d_seq = features_2d
+    @staticmethod
+    def _infer_hw(seq_len: int):
+        side = int(math.sqrt(seq_len))
+        if side * side == seq_len:
+            return side, side
+        return seq_len, 1
 
-        if features_3d.dim() == 4:
-            _, h3, w3, _ = features_3d.shape
-            features_3d_seq = features_3d.reshape(b, h3 * w3, -1)
+    @staticmethod
+    def _align_feature_grids(features_2d: torch.Tensor, features_3d: torch.Tensor):
+        if features_2d.dim() == 4 and features_3d.dim() == 4:
+            target_h, target_w = features_2d.shape[1], features_2d.shape[2]
+            if features_3d.shape[1] != target_h or features_3d.shape[2] != target_w:
+                features_3d = features_3d.permute(0, 3, 1, 2)
+                features_3d = F.interpolate(
+                    features_3d,
+                    size=(target_h, target_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                features_3d = features_3d.permute(0, 2, 3, 1)
+        return features_2d, features_3d
+
+    def forward(self, features_2d: torch.Tensor, features_3d: torch.Tensor) -> torch.Tensor:
+        features_2d, features_3d = self._align_feature_grids(features_2d, features_3d)
+        is_grid_input = features_2d.dim() == 4
+
+        if is_grid_input:
+            h_grid, w_grid = features_2d.shape[1], features_2d.shape[2]
+            features_2d_core = features_2d
+            features_3d_core = features_3d
         else:
-            features_3d_seq = features_3d
+            h_grid, w_grid = self._infer_hw(features_2d.shape[1])
+            features_2d_core = features_2d
+            features_3d_core = features_3d
 
         if self.fusion_method == "add":
-            fusion_feature = features_2d_seq + features_3d_seq
+            fusion_feature = features_2d_core + features_3d_core
         elif self.fusion_method == "concat":
             fusion_feature = self.projection(
-                torch.cat([self.norm1(features_2d_seq), self.norm2(features_3d_seq)], dim=-1)
+                torch.cat([self.norm1(features_2d_core), self.norm2(features_3d_core)], dim=-1)
             )
         elif self.fusion_method == "cross_attention":
-            x = features_2d_seq
+            x = features_2d_core
             for block in self.cross_attn_blocks:
-                x = block(x, features_3d_seq)
+                x = block(x, features_3d_core, h_grid, w_grid)
             fusion_feature = x
         elif self.fusion_method == "gated":
-            norm2d = self.norm1(features_2d_seq)
-            norm3d = self.norm2(features_3d_seq)
+            norm2d = self.norm1(features_2d_core)
+            norm3d = self.norm2(features_3d_core)
             gate = self.gate_projection(torch.cat([norm2d, norm3d], dim=-1))
             fusion_feature = gate * norm2d + (1 - gate) * norm3d
         elif self.fusion_method == "weighted":
             weight_sum = self.weight_2d + self.weight_3d + 1e-6
             w2d = self.weight_2d / weight_sum
             w3d = self.weight_3d / weight_sum
-            fusion_feature = w2d * features_2d_seq + w3d * features_3d_seq
+            fusion_feature = w2d * features_2d_core + w3d * features_3d_core
         elif self.fusion_method == "only_3d":
-            fusion_feature = features_3d_seq
+            fusion_feature = features_3d_core
         elif self.fusion_method == "zero":
-            fusion_feature = features_2d_seq
+            fusion_feature = features_2d_core
         else:
             raise ValueError(f"Unknown fusion method: {self.fusion_method}")
 
-        if features_2d.dim() == 4:
-            return fusion_feature.reshape(b, h, w, -1)
         return fusion_feature
 
 

@@ -4,15 +4,22 @@ export WANDB_MODE=offline
 export WANDB_DIR=/mnt/sfs_turbo_new/R10844/zhangpeilun/openuav_vggt/TravelUAV/Model/LLaMA-UAV/wandb
 export PATH=/mnt/sfs_turbo/R10840/anaconda3/envs/travel_vggt/bin:$PATH
 
-# 获取当前 conda 环境中 python 的 site-packages 路径
+# Resolve the current conda environment site-packages path.
 SITE_PACKAGES="/mnt/sfs_turbo/R10840/anaconda3/envs/travel_vggt/lib/python3.10/site-packages"
 
-# 强制将 PyTorch 随附的 NVIDIA 库排在系统环境变量的最前面
+# Prefer the PyTorch-bundled NVIDIA libraries.
 export LD_LIBRARY_PATH="${SITE_PACKAGES}/nvidia/cublas/lib:${SITE_PACKAGES}/nvidia/nccl/lib:${SITE_PACKAGES}/nvidia/cudnn/lib:$LD_LIBRARY_PATH"
 root_dir=/mnt/sfs_turbo_new/R10844/zhangpeilun/openuav_vggt/TravelUAV # TravelUAV directory
 model_dir=$root_dir/Model/LLaMA-UAV
 
-# 设置CUDA设备
+# Set this to a local checkpoint to skip VGGT network download.
+VGGT_MODEL_PATH=${VGGT_MODEL_PATH:-}
+EXTRA_TRAIN_ARGS=()
+if [ -n "$VGGT_MODEL_PATH" ]; then
+    EXTRA_TRAIN_ARGS+=(--vggt_model_path "$VGGT_MODEL_PATH")
+fi
+
+# Set visible CUDA devices if needed.
 # export CUDA_VISIBLE_DEVICES=5
 
 deepspeed \
@@ -61,3 +68,4 @@ deepspeed \
     --lazy_preprocess True \
     --report_to wandb \
     --lora_enable True \
+    "${EXTRA_TRAIN_ARGS[@]}"

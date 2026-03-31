@@ -1,9 +1,59 @@
+import logging
+import os
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 
 from vggt.models.vggt import VGGT
+
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_VGGT_MODEL_REPO = "facebook/VGGT-1B"
+DEFAULT_VGGT_MODEL_URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+
+
+def _extract_checkpoint_state_dict(checkpoint):
+    if not isinstance(checkpoint, dict):
+        return checkpoint
+
+    for key in ("state_dict", "model_state_dict", "model", "module", "weights"):
+        value = checkpoint.get(key)
+        if isinstance(value, dict):
+            return value
+    return checkpoint
+
+
+def _strip_state_dict_prefix(state_dict, prefix):
+    if not prefix:
+        return state_dict
+
+    if not any(key.startswith(prefix) for key in state_dict.keys()):
+        return state_dict
+
+    return {
+        key[len(prefix):] if key.startswith(prefix) else key: value
+        for key, value in state_dict.items()
+    }
+
+
+def _load_vggt_state_dict(vggt_model: nn.Module, checkpoint, source_name: str):
+    state_dict = _extract_checkpoint_state_dict(checkpoint)
+    if not isinstance(state_dict, dict):
+        raise ValueError(f"Unsupported VGGT checkpoint format from {source_name}.")
+
+    for prefix in ("module.", "geometry_encoder.vggt.", "geometry_encoder.", "vggt."):
+        state_dict = _strip_state_dict_prefix(state_dict, prefix)
+
+    incompatible_keys = vggt_model.load_state_dict(state_dict, strict=False)
+    missing_keys = list(getattr(incompatible_keys, "missing_keys", []))
+    unexpected_keys = list(getattr(incompatible_keys, "unexpected_keys", []))
+
+    if missing_keys:
+        logger.warning("Missing %d VGGT keys when loading from %s", len(missing_keys), source_name)
+    if unexpected_keys:
+        logger.warning("Unexpected %d VGGT keys when loading from %s", len(unexpected_keys), source_name)
 
 
 @dataclass
@@ -16,8 +66,19 @@ class FeatureFusionConfig:
 
 
 class VGGTGeometryEncoder(nn.Module):
-    def __init__(self):
+    def __init__(
+        self,
+        vggt_model_path=None,
+        vggt_model_repo: str = DEFAULT_VGGT_MODEL_REPO,
+        vggt_model_url: str = DEFAULT_VGGT_MODEL_URL,
+        vggt_auto_download: bool = True,
+    ):
         super().__init__()
+        self.vggt_model_path = vggt_model_path
+        self.vggt_model_repo = vggt_model_repo
+        self.vggt_model_url = vggt_model_url
+        self.vggt_auto_download = vggt_auto_download
+        self._weights_initialized = False
         self.vggt = VGGT(
             img_size=224,
             patch_size=14,
@@ -28,8 +89,7 @@ class VGGTGeometryEncoder(nn.Module):
             enable_track=False,
         )
         self.vggt.eval()
-        for param in self.vggt.parameters():
-            param.requires_grad = False
+        self._freeze_vggt_model()
 
     @property
     def patch_size(self):
@@ -38,6 +98,59 @@ class VGGTGeometryEncoder(nn.Module):
     @property
     def feature_dim(self):
         return 2048
+
+    def _freeze_vggt_model(self):
+        self.vggt.eval()
+        for param in self.vggt.parameters():
+            param.requires_grad = False
+
+    def initialize_vggt_weights(self, force_reload: bool = False):
+        if self._weights_initialized and not force_reload:
+            return
+
+        loaded_from = None
+
+        if self.vggt_model_path:
+            if not os.path.isfile(self.vggt_model_path):
+                logger.warning("VGGT checkpoint not found at %s, falling back to download.", self.vggt_model_path)
+            else:
+                try:
+                    checkpoint = torch.load(self.vggt_model_path, map_location="cpu")
+                    _load_vggt_state_dict(self.vggt, checkpoint, self.vggt_model_path)
+                    loaded_from = self.vggt_model_path
+                except Exception as exc:
+                    logger.warning("Failed to load local VGGT checkpoint %s: %s", self.vggt_model_path, exc)
+
+        if loaded_from is None and self.vggt_auto_download and self.vggt_model_repo:
+            try:
+                pretrained_model = VGGT.from_pretrained(
+                    self.vggt_model_repo,
+                    enable_camera=False,
+                    enable_point=False,
+                    enable_depth=False,
+                    enable_track=False,
+                )
+                self.vggt.load_state_dict(pretrained_model.state_dict(), strict=False)
+                loaded_from = self.vggt_model_repo
+            except Exception as exc:
+                logger.warning("Failed to load VGGT weights from repo %s: %s", self.vggt_model_repo, exc)
+
+        if loaded_from is None and self.vggt_auto_download and self.vggt_model_url:
+            try:
+                checkpoint = torch.hub.load_state_dict_from_url(self.vggt_model_url, map_location="cpu")
+                _load_vggt_state_dict(self.vggt, checkpoint, self.vggt_model_url)
+                loaded_from = self.vggt_model_url
+            except Exception as exc:
+                logger.warning("Failed to load VGGT weights from URL %s: %s", self.vggt_model_url, exc)
+
+        if loaded_from is None:
+            raise RuntimeError(
+                "Unable to initialize VGGT weights. Provide --vggt_model_path or enable network download."
+            )
+
+        self._freeze_vggt_model()
+        self._weights_initialized = True
+        logger.info("Initialized VGGT weights from %s", loaded_from)
 
     def encode(self, images: torch.Tensor) -> torch.Tensor:
         if images.dim() == 3:

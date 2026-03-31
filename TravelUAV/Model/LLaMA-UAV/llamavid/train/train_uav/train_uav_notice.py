@@ -104,6 +104,10 @@ class ModelArguments:
     fusion_num_layers: Optional[int] = field(default=1)
     fusion_dropout: Optional[float] = field(default=0.1)
     geometry_merge_size: Optional[int] = field(default=4)
+    vggt_model_path: Optional[str] = field(default=None)
+    vggt_model_repo: Optional[str] = field(default="facebook/VGGT-1B")
+    vggt_model_url: Optional[str] = field(default="https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt")
+    vggt_auto_download: bool = field(default=True)
 
 
 @dataclass
@@ -1125,10 +1129,15 @@ def train():
         fusion_num_layers=model_args.fusion_num_layers,
         fusion_dropout=model_args.fusion_dropout,
         geometry_merge_size=model_args.geometry_merge_size,
+        vggt_model_path=model_args.vggt_model_path,
+        vggt_model_repo=model_args.vggt_model_repo,
+        vggt_model_url=model_args.vggt_model_url,
+        vggt_auto_download=model_args.vggt_auto_download,
         config=config,
         cache_dir=training_args.cache_dir,
         **bnb_model_from_pretrained_args
     )
+    model.initialize_vggt_weights()
     model.config.use_cache = False
 
     if model_args.freeze_backbone:

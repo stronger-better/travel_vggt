@@ -85,8 +85,25 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
         fusion_layers = model_args.get("fusion_num_layers", 1)
         fusion_dropout = model_args.get("fusion_dropout", 0.1)
         self.geometry_merge_size = int(model_args.get("geometry_merge_size", 4))
+        vggt_model_path = model_args.get("vggt_model_path", getattr(config, "vggt_model_path", None))
+        vggt_model_repo = model_args.get("vggt_model_repo", getattr(config, "vggt_model_repo", "facebook/VGGT-1B"))
+        vggt_model_url = model_args.get(
+            "vggt_model_url",
+            getattr(config, "vggt_model_url", "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"),
+        )
+        vggt_auto_download = model_args.get("vggt_auto_download", getattr(config, "vggt_auto_download", True))
 
-        self.geometry_encoder = VGGTGeometryEncoder()
+        self.config.vggt_model_path = vggt_model_path
+        self.config.vggt_model_repo = vggt_model_repo
+        self.config.vggt_model_url = vggt_model_url
+        self.config.vggt_auto_download = vggt_auto_download
+
+        self.geometry_encoder = VGGTGeometryEncoder(
+            vggt_model_path=vggt_model_path,
+            vggt_model_repo=vggt_model_repo,
+            vggt_model_url=vggt_model_url,
+            vggt_auto_download=vggt_auto_download,
+        )
         self.geometry_merger = GeometryFeatureMerger(
             output_dim=config.hidden_size,
             hidden_dim=config.hidden_size,
@@ -118,6 +135,9 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
 
     def get_model(self):
         return self.model
+
+    def initialize_vggt_weights(self, force_reload: bool = False):
+        self.geometry_encoder.initialize_vggt_weights(force_reload=force_reload)
 
     @staticmethod
     def _infer_image_token_layout(total_tokens: int):

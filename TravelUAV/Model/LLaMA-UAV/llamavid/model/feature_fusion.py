@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+from safetensors.torch import load_file as safe_load_file
 
 from vggt.models.vggt import VGGT
 
@@ -12,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_VGGT_MODEL_REPO = "facebook/VGGT-1B"
 DEFAULT_VGGT_MODEL_URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+LOCAL_VGGT_CANDIDATE_FILES = ("model.safetensors", "model.pt")
 
 
 def _extract_checkpoint_state_dict(checkpoint):
@@ -54,6 +56,39 @@ def _load_vggt_state_dict(vggt_model: nn.Module, checkpoint, source_name: str):
         logger.warning("Missing %d VGGT keys when loading from %s", len(missing_keys), source_name)
     if unexpected_keys:
         logger.warning("Unexpected %d VGGT keys when loading from %s", len(unexpected_keys), source_name)
+
+
+def _resolve_vggt_checkpoint_path(local_path: str):
+    if not local_path:
+        return None
+
+    normalized_path = os.path.expanduser(local_path)
+    if os.path.isfile(normalized_path):
+        return normalized_path
+
+    if os.path.isdir(normalized_path):
+        for candidate_name in LOCAL_VGGT_CANDIDATE_FILES:
+            candidate_path = os.path.join(normalized_path, candidate_name)
+            if os.path.isfile(candidate_path):
+                return candidate_path
+        logger.warning(
+            "VGGT checkpoint directory %s does not contain any of %s",
+            normalized_path,
+            ", ".join(LOCAL_VGGT_CANDIDATE_FILES),
+        )
+        return None
+
+    logger.warning("VGGT checkpoint path %s does not exist.", normalized_path)
+    return None
+
+
+def _load_local_vggt_checkpoint(vggt_model: nn.Module, checkpoint_path: str):
+    if checkpoint_path.endswith(".safetensors"):
+        checkpoint = safe_load_file(checkpoint_path, device="cpu")
+    else:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+    _load_vggt_state_dict(vggt_model, checkpoint, checkpoint_path)
 
 
 @dataclass
@@ -111,15 +146,15 @@ class VGGTGeometryEncoder(nn.Module):
         loaded_from = None
 
         if self.vggt_model_path:
-            if not os.path.isfile(self.vggt_model_path):
+            local_checkpoint_path = _resolve_vggt_checkpoint_path(self.vggt_model_path)
+            if local_checkpoint_path is None:
                 logger.warning("VGGT checkpoint not found at %s, falling back to download.", self.vggt_model_path)
             else:
                 try:
-                    checkpoint = torch.load(self.vggt_model_path, map_location="cpu")
-                    _load_vggt_state_dict(self.vggt, checkpoint, self.vggt_model_path)
-                    loaded_from = self.vggt_model_path
+                    _load_local_vggt_checkpoint(self.vggt, local_checkpoint_path)
+                    loaded_from = local_checkpoint_path
                 except Exception as exc:
-                    logger.warning("Failed to load local VGGT checkpoint %s: %s", self.vggt_model_path, exc)
+                    logger.warning("Failed to load local VGGT checkpoint %s: %s", local_checkpoint_path, exc)
 
         if loaded_from is None and self.vggt_auto_download and self.vggt_model_repo:
             try:

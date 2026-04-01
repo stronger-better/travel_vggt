@@ -278,6 +278,10 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
         if not sgf_injection_plan:
             return hidden_states
 
+        # Read from the original hidden states and write into a separate clone.
+        # This avoids version-counter mismatches when a view used to compute
+        # `fused_slice` is later overwritten in-place on the same base tensor.
+        source_hidden_states = hidden_states
         fused_hidden_states = hidden_states.clone()
         for plan_item in sgf_injection_plan:
             batch_idx = plan_item["batch_idx"]
@@ -290,7 +294,7 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
             if batch_idx >= fused_hidden_states.shape[0] or end_idx > fused_hidden_states.shape[1]:
                 continue
 
-            current_slice = fused_hidden_states[batch_idx, start_idx:end_idx]
+            current_slice = source_hidden_states[batch_idx, start_idx:end_idx]
             fused_slice = self.fuse_current_image_features_with_geometry_context(current_slice, geometry_context)
             if fused_slice.shape == current_slice.shape:
                 fused_hidden_states[batch_idx, start_idx:end_idx] = fused_slice

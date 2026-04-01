@@ -16,7 +16,7 @@ model_dir=$root_dir/Model/LLaMA-UAV
 
 # Training launch values used for subsequent GeoThinker runs.
 VGGT_MODEL_PATH=/mnt/sfs_turbo_new/R10844/zhangpeilun/openuav_vggt/TravelUAV/vggt_checkpoints
-DEEPSPEED_INCLUDE=localhost:7
+DEEPSPEED_INCLUDE=localhost:0,1,2,3,4,5,6,7
 MASTER_PORT=23101
 OUTPUT_DIR=$model_dir/work_dirs/new-evovle-geo-qwen-vid-7b-pretrain-224-uav-full-data-lora32
 

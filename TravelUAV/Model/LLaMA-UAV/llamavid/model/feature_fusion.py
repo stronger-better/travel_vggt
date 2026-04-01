@@ -110,6 +110,8 @@ class FeatureFusionConfig:
     num_heads: int = 8
     dropout: float = 0.1
     num_layers: int = 1
+    importance_gating: bool = False
+    importance_gate_init: float = 0.0
 
 
 class VGGTGeometryEncoder(nn.Module):
@@ -213,19 +215,32 @@ class VGGTGeometryEncoder(nn.Module):
 
 
 class CrossAttentionBlock(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, dropout: float):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        dropout: float,
+        importance_gating: bool = False,
+        importance_gate_init: float = 0.0,
+    ):
         super().__init__()
+        if hidden_size % num_heads != 0:
+            raise ValueError(f"hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads})")
+
         self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.importance_gating = importance_gating
         self.norm1_query = nn.LayerNorm(hidden_size)
         self.norm1_key = nn.LayerNorm(hidden_size)
         self.norm1_value = nn.LayerNorm(hidden_size)
         self.norm2 = nn.LayerNorm(hidden_size)
-        self.cross_attention = nn.MultiheadAttention(
-            embed_dim=hidden_size,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
+        self.q_proj = nn.Linear(hidden_size, hidden_size)
+        self.k_proj = nn.Linear(hidden_size, hidden_size)
+        self.v_proj = nn.Linear(hidden_size, hidden_size)
+        self.out_proj = nn.Linear(hidden_size, hidden_size)
+        self.attn_dropout = nn.Dropout(dropout)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_size, hidden_size * 4),
             nn.GELU(),
@@ -233,6 +248,14 @@ class CrossAttentionBlock(nn.Module):
             nn.Linear(hidden_size * 4, hidden_size),
             nn.Dropout(dropout),
         )
+        if self.importance_gating:
+            self.importance_query_proj = nn.Linear(hidden_size, num_heads)
+            self.importance_key_proj = nn.Linear(hidden_size, num_heads)
+            self.importance_scale = nn.Parameter(torch.tensor(float(importance_gate_init)))
+            nn.init.zeros_(self.importance_query_proj.weight)
+            nn.init.zeros_(self.importance_query_proj.bias)
+            nn.init.zeros_(self.importance_key_proj.weight)
+            nn.init.zeros_(self.importance_key_proj.bias)
 
     @staticmethod
     def _get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: torch.Tensor) -> torch.Tensor:
@@ -295,7 +318,27 @@ class CrossAttentionBlock(nn.Module):
 
         query = query + pos_embed
         key = key + pos_embed
-        attn_output, _ = self.cross_attention(query, key, value)
+        batch_size, query_len, _ = query.shape
+        key_len = key.shape[1]
+
+        q = self.q_proj(query).reshape(batch_size, query_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(key).reshape(batch_size, key_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(value).reshape(batch_size, key_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+        if self.importance_gating:
+            importance_query = self.importance_query_proj(query).transpose(1, 2).unsqueeze(-1)
+            importance_key = self.importance_key_proj(key).transpose(1, 2).unsqueeze(-2)
+            importance_logits = importance_query + importance_key
+            importance_bias = F.logsigmoid(importance_logits)
+            attn_scores = attn_scores + self.importance_scale.to(dtype=attn_scores.dtype) * importance_bias
+
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
+        attn_output = torch.matmul(attn_weights, v)
+        attn_output = attn_output.transpose(1, 2).reshape(batch_size, query_len, self.hidden_size)
+        attn_output = self.out_proj(attn_output)
         fused = features_2d_seq + attn_output
         fused = fused + self.mlp(self.norm2(fused))
 
@@ -322,6 +365,8 @@ class FeatureFusionModule(nn.Module):
                         hidden_size=self.hidden_size,
                         num_heads=self.config.num_heads,
                         dropout=self.config.dropout,
+                        importance_gating=self.config.importance_gating,
+                        importance_gate_init=self.config.importance_gate_init,
                     )
                     for _ in range(self.config.num_layers)
                 ]

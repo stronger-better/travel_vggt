@@ -210,6 +210,12 @@ class LlamaUAVModel(LlamaModel):
 
             hidden_states = layer_outputs[0]
 
+            sgf_injection_layers = getattr(self, "_sgf_injection_layers", None)
+            sgf_injection_plan = getattr(self, "_sgf_injection_plan", None)
+            sgf_apply_fn = getattr(self, "_sgf_apply_fn", None)
+            if sgf_apply_fn is not None and sgf_injection_plan and sgf_injection_layers and idx in sgf_injection_layers:
+                hidden_states = sgf_apply_fn(hidden_states, sgf_injection_plan, layer_idx=idx)
+
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
 

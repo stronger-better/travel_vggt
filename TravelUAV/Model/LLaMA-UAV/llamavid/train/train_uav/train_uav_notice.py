@@ -233,6 +233,8 @@ class ModelArguments:
     version: Optional[str] = field(default="v0")
     freeze_backbone: bool = field(default=False)
     tune_mm_mlp_adapter: bool = field(default=False)
+    tune_geometry_merger: bool = field(default=True)
+    tune_feature_fusion: bool = field(default=True)
     tune_waypoint_predictor: bool = field(default=True)
     vision_tower: Optional[str] = field(default=None)
     image_processor: Optional[str] = field(default=None)
@@ -251,6 +253,9 @@ class ModelArguments:
     fusion_attention_heads: Optional[int] = field(default=8)
     fusion_num_layers: Optional[int] = field(default=1)
     fusion_dropout: Optional[float] = field(default=0.1)
+    importance_gating: bool = field(default=False)
+    importance_gate_init: Optional[float] = field(default=0.0)
+    sgf_injection_layers: Optional[str] = field(default="")
     geometry_merge_size: Optional[int] = field(default=4)
     vggt_model_path: Optional[str] = field(default=None)
     vggt_model_repo: Optional[str] = field(default="facebook/VGGT-1B")
@@ -388,7 +393,11 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
                                    output_dir: str):
     """Collects the state dict and dump to disk."""
 
-    if getattr(trainer.args, "tune_mm_mlp_adapter", False):
+    if (
+        getattr(trainer.args, "tune_mm_mlp_adapter", False)
+        or getattr(trainer.args, "tune_geometry_merger", False)
+        or getattr(trainer.args, "tune_feature_fusion", False)
+    ):
         # Only save Adapter
         # keys_to_match = ['mm_projector']
         keys_to_match = ['mm_projector', 'vision_resampler', 'vlm_att', 'waypoint_emb', 'waypoints_fc', 'waypoints_predictor',
@@ -1283,6 +1292,9 @@ def train():
         fusion_attention_heads=model_args.fusion_attention_heads,
         fusion_num_layers=model_args.fusion_num_layers,
         fusion_dropout=model_args.fusion_dropout,
+        importance_gating=model_args.importance_gating,
+        importance_gate_init=model_args.importance_gate_init,
+        sgf_injection_layers=model_args.sgf_injection_layers,
         geometry_merge_size=model_args.geometry_merge_size,
         vggt_model_path=model_args.vggt_model_path,
         vggt_model_repo=model_args.vggt_model_repo,
@@ -1379,16 +1391,28 @@ def train():
         model.config.image_grid_pinpoints = data_args.image_grid_pinpoints
 
         model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
-        if model_args.tune_mm_mlp_adapter:
+        training_args.tune_geometry_merger = model.config.tune_geometry_merger = model_args.tune_geometry_merger
+        training_args.tune_feature_fusion = model.config.tune_feature_fusion = model_args.tune_feature_fusion
+        if (
+            model_args.tune_mm_mlp_adapter
+            or model_args.tune_geometry_merger
+            or model_args.tune_feature_fusion
+        ):
             model.requires_grad_(False)
             for p in model.get_model().mm_projector.parameters():
-                p.requires_grad = True
+                p.requires_grad = model_args.tune_mm_mlp_adapter
             if hasattr(model, "geometry_merger"):
                 for p in model.geometry_merger.parameters():
-                    p.requires_grad = True
+                    p.requires_grad = model_args.tune_geometry_merger
             if hasattr(model, "feature_fusion"):
                 for p in model.feature_fusion.parameters():
-                    p.requires_grad = True
+                    p.requires_grad = model_args.tune_feature_fusion
+            rank0_print(
+                "Train module flags | "
+                f"mm_projector={model_args.tune_mm_mlp_adapter}, "
+                f"geometry_merger={model_args.tune_geometry_merger}, "
+                f"feature_fusion={model_args.tune_feature_fusion}"
+            )
 
         model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
         if training_args.freeze_mm_mlp_adapter:

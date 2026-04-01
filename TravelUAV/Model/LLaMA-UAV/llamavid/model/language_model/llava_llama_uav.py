@@ -57,6 +57,32 @@ class CosineDirectionLoss(nn.Module):
         return loss.mean()
 
 
+def _parse_sgf_injection_layers(layer_spec, num_hidden_layers: int) -> List[int]:
+    if layer_spec is None:
+        return []
+
+    if isinstance(layer_spec, int):
+        layer_values = [layer_spec]
+    elif isinstance(layer_spec, (list, tuple)):
+        layer_values = list(layer_spec)
+    else:
+        normalized = str(layer_spec).strip()
+        if not normalized:
+            return []
+        if normalized.lower() in {"all", "*"}:
+            return list(range(num_hidden_layers))
+        layer_values = [chunk.strip() for chunk in normalized.split(",") if chunk.strip()]
+
+    parsed_layers = []
+    for raw_value in layer_values:
+        layer_idx = int(raw_value)
+        if layer_idx < 0:
+            layer_idx = num_hidden_layers + layer_idx
+        if 0 <= layer_idx < num_hidden_layers:
+            parsed_layers.append(layer_idx)
+    return sorted(set(parsed_layers))
+
+
 class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
     config_class = LlavaConfig
 
@@ -84,6 +110,9 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
         fusion_heads = model_args.get("fusion_attention_heads", max(1, config.num_attention_heads // 4))
         fusion_layers = model_args.get("fusion_num_layers", 1)
         fusion_dropout = model_args.get("fusion_dropout", 0.1)
+        importance_gating = model_args.get("importance_gating", False)
+        importance_gate_init = model_args.get("importance_gate_init", 0.0)
+        sgf_injection_layers = model_args.get("sgf_injection_layers", getattr(config, "sgf_injection_layers", ""))
         self.geometry_merge_size = int(model_args.get("geometry_merge_size", 4))
         vggt_model_path = model_args.get("vggt_model_path", getattr(config, "vggt_model_path", None))
         vggt_model_repo = model_args.get("vggt_model_repo", getattr(config, "vggt_model_repo", "facebook/VGGT-1B"))
@@ -97,6 +126,7 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
         self.config.vggt_model_repo = vggt_model_repo
         self.config.vggt_model_url = vggt_model_url
         self.config.vggt_auto_download = vggt_auto_download
+        self.config.sgf_injection_layers = sgf_injection_layers
 
         self.geometry_encoder = VGGTGeometryEncoder(
             vggt_model_path=vggt_model_path,
@@ -118,8 +148,14 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
                 num_heads=fusion_heads,
                 dropout=fusion_dropout,
                 num_layers=fusion_layers,
+                importance_gating=importance_gating,
+                importance_gate_init=importance_gate_init,
             )
         )
+        self.sgf_injection_layers = _parse_sgf_injection_layers(sgf_injection_layers, config.num_hidden_layers)
+        self.model._sgf_injection_layers = set(self.sgf_injection_layers)
+        self.model._sgf_apply_fn = self.apply_sgf_to_hidden_states
+        self.model._sgf_injection_plan = None
         self.vggt_model = None
         self.vggt_latent_projector = None
 
@@ -151,40 +187,32 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
 
         return None, None
 
-    def fuse_current_image_features_with_geometry(self, current_image_feature, sample_vggt_images):
+    def build_sgf_geometry_context(self, current_image_feature, sample_vggt_images):
         if sample_vggt_images is None:
-            return current_image_feature
+            return None
 
         if sample_vggt_images.dim() == 3:
             sample_vggt_images = sample_vggt_images.unsqueeze(0)
 
         if sample_vggt_images.shape[0] == 0 or current_image_feature.shape[0] == 0:
-            return current_image_feature
+            return None
 
         n_image = sample_vggt_images.shape[0]
         total_tokens = current_image_feature.shape[0]
         if total_tokens % n_image != 0:
-            return current_image_feature
+            return None
 
         token_per_image = total_tokens // n_image
         vis_side, has_ctx = self._infer_image_token_layout(token_per_image)
         if vis_side is None:
-            return current_image_feature
-
-        image_tokens = current_image_feature.reshape(n_image, token_per_image, -1)
-        if has_ctx:
-            ctx_tokens = image_tokens[:, :1, :]
-            vis_tokens = image_tokens[:, 1:, :]
-        else:
-            ctx_tokens = None
-            vis_tokens = image_tokens
+            return None
 
         geometry_tokens = self.geometry_encoder.encode(sample_vggt_images)
         geometry_tokens = geometry_tokens.to(device=current_image_feature.device, dtype=current_image_feature.dtype)
         geo_token_num = geometry_tokens.shape[1]
         geo_side = int(geo_token_num ** 0.5)
         if geo_side * geo_side != geo_token_num:
-            return current_image_feature
+            return None
 
         geometry_grid = geometry_tokens.reshape(n_image, geo_side, geo_side, -1)
         merged_geometry = self.geometry_merger(geometry_grid, target_hw=(vis_side, vis_side))
@@ -197,6 +225,41 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
                 align_corners=False,
             )
             merged_geometry = merged_geometry.permute(0, 2, 3, 1)
+        return {
+            "n_image": n_image,
+            "vis_side": vis_side,
+            "has_ctx": has_ctx,
+            "merged_geometry": merged_geometry,
+        }
+
+    def fuse_current_image_features_with_geometry_context(self, current_image_feature, geometry_context):
+        if geometry_context is None:
+            return current_image_feature
+
+        n_image = geometry_context["n_image"]
+        vis_side = geometry_context["vis_side"]
+        has_ctx = geometry_context["has_ctx"]
+        merged_geometry = geometry_context["merged_geometry"].to(
+            device=current_image_feature.device,
+            dtype=current_image_feature.dtype,
+        )
+
+        total_tokens = current_image_feature.shape[0]
+        if total_tokens % n_image != 0:
+            return current_image_feature
+
+        token_per_image = total_tokens // n_image
+        image_tokens = current_image_feature.reshape(n_image, token_per_image, -1)
+        if has_ctx:
+            ctx_tokens = image_tokens[:, :1, :]
+            vis_tokens = image_tokens[:, 1:, :]
+        else:
+            ctx_tokens = None
+            vis_tokens = image_tokens
+
+        if vis_tokens.shape[1] != vis_side * vis_side:
+            return current_image_feature
+
         vis_grid = vis_tokens.reshape(n_image, vis_side, vis_side, -1)
         fused_vis_grid = self.feature_fusion(vis_grid, merged_geometry)
         fused_vis_tokens = fused_vis_grid.reshape(n_image, vis_side * vis_side, -1)
@@ -206,6 +269,32 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
         else:
             fused_tokens = fused_vis_tokens
         return fused_tokens.reshape(total_tokens, -1)
+
+    def fuse_current_image_features_with_geometry(self, current_image_feature, sample_vggt_images):
+        geometry_context = self.build_sgf_geometry_context(current_image_feature, sample_vggt_images)
+        return self.fuse_current_image_features_with_geometry_context(current_image_feature, geometry_context)
+
+    def apply_sgf_to_hidden_states(self, hidden_states, sgf_injection_plan, layer_idx=None):
+        if not sgf_injection_plan:
+            return hidden_states
+
+        fused_hidden_states = hidden_states.clone()
+        for plan_item in sgf_injection_plan:
+            batch_idx = plan_item["batch_idx"]
+            start_idx = plan_item["start_idx"]
+            end_idx = plan_item["end_idx"]
+            geometry_context = plan_item["geometry_context"]
+
+            if geometry_context is None:
+                continue
+            if batch_idx >= fused_hidden_states.shape[0] or end_idx > fused_hidden_states.shape[1]:
+                continue
+
+            current_slice = fused_hidden_states[batch_idx, start_idx:end_idx]
+            fused_slice = self.fuse_current_image_features_with_geometry_context(current_slice, geometry_context)
+            if fused_slice.shape == current_slice.shape:
+                fused_hidden_states[batch_idx, start_idx:end_idx] = fused_slice
+        return fused_hidden_states
 
     def forward_waypoint(self, hidden_states):
         _, hidden_size = hidden_states.size()

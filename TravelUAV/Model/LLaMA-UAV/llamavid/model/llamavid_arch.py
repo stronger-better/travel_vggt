@@ -481,6 +481,8 @@ class LLaMAVIDMetaForCausalLM(ABC):
     ): 
         if prompts is None and hasattr(self, 'prompts'):
             prompts = self.prompts
+        if hasattr(self.get_model(), "_sgf_injection_plan"):
+            self.get_model()._sgf_injection_plan = None
         torch.cuda.empty_cache()
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
@@ -556,6 +558,8 @@ class LLaMAVIDMetaForCausalLM(ABC):
             current_image_features = []
             history_image_features = []
             history_waypoint_features = []
+            use_layerwise_sgf = bool(getattr(self.get_model(), "_sgf_injection_layers", None)) and hasattr(self, "build_sgf_geometry_context")
+            layerwise_sgf_contexts = []
             comma_id = torch.tensor(special_token_dict[',']).to(input_ids.device)
             semi_id = torch.tensor(special_token_dict[';']).to(input_ids.device)
             for i in range(len(image_features)):
@@ -573,17 +577,29 @@ class LLaMAVIDMetaForCausalLM(ABC):
                 history_waypoint_features.append(historys[i].view(1, -1, current_image_feature.shape[-1]))
 
             if vggt_images is not None and hasattr(self, "fuse_current_image_features_with_geometry"):
-                fused_current_image_features = []
-                for i, current_image_feature in enumerate(current_image_features):
-                    sample_vggt_images = None
-                    if isinstance(vggt_images, torch.Tensor):
-                        sample_vggt_images = vggt_images[i]
-                    fused_feature = self.fuse_current_image_features_with_geometry(
-                        current_image_feature[0],
-                        sample_vggt_images,
-                    )
-                    fused_current_image_features.append(fused_feature.unsqueeze(0))
-                current_image_features = fused_current_image_features
+                if use_layerwise_sgf:
+                    for i, current_image_feature in enumerate(current_image_features):
+                        sample_vggt_images = None
+                        if isinstance(vggt_images, torch.Tensor):
+                            sample_vggt_images = vggt_images[i]
+                        layerwise_sgf_contexts.append(
+                            self.build_sgf_geometry_context(current_image_feature[0], sample_vggt_images)
+                        )
+                else:
+                    fused_current_image_features = []
+                    for i, current_image_feature in enumerate(current_image_features):
+                        sample_vggt_images = None
+                        if isinstance(vggt_images, torch.Tensor):
+                            sample_vggt_images = vggt_images[i]
+                        fused_feature = self.fuse_current_image_features_with_geometry(
+                            current_image_feature[0],
+                            sample_vggt_images,
+                        )
+                        fused_current_image_features.append(fused_feature.unsqueeze(0))
+                    current_image_features = fused_current_image_features
+            else:
+                use_layerwise_sgf = False
+                layerwise_sgf_contexts = []
                 
         elif v2:
             for i in range(len(image_features)):
@@ -603,6 +619,7 @@ class LLaMAVIDMetaForCausalLM(ABC):
         new_input_embeds = []
         new_labels = [] if labels is not None else None
         cur_image_idx = 0
+        sgf_injection_plan = [] if v3 and 'use_layerwise_sgf' in locals() and use_layerwise_sgf else None
         from llamavid.constants import IGNORE_INDEX # 确保 IGNORE_INDEX 被引入
         
         for batch_idx, cur_input_ids in enumerate(input_ids):
@@ -667,6 +684,7 @@ class LLaMAVIDMetaForCausalLM(ABC):
                     cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[history_image_indice + 1: history_waypoint_indice]))
                     cur_new_input_embeds.append(history_waypoint_feature)
                     cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[history_waypoint_indice + 1: current_image_indice]))
+                    current_image_start_idx = sum(x.shape[0] for x in cur_new_input_embeds)
                     cur_new_input_embeds.append(current_image_feature)
                     
                     if vggt_3d_tokens is not None:
@@ -677,6 +695,7 @@ class LLaMAVIDMetaForCausalLM(ABC):
                     cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[:history_image_indice]))
                     cur_new_input_embeds.append(history_image_feature)
                     cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[history_image_indice + 1: current_image_indice]))
+                    current_image_start_idx = sum(x.shape[0] for x in cur_new_input_embeds)
                     cur_new_input_embeds.append(current_image_feature)
                     
                     if vggt_3d_tokens is not None:
@@ -684,10 +703,21 @@ class LLaMAVIDMetaForCausalLM(ABC):
                         
                 else:
                     cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids[: current_image_indice]))
+                    current_image_start_idx = sum(x.shape[0] for x in cur_new_input_embeds)
                     cur_new_input_embeds.append(current_image_feature)
                     
                     if vggt_3d_tokens is not None:
                         cur_new_input_embeds.append(vggt_3d_tokens) # [新增]
+
+                if sgf_injection_plan is not None:
+                    sgf_injection_plan.append(
+                        {
+                            "batch_idx": batch_idx,
+                            "start_idx": current_image_start_idx,
+                            "end_idx": current_image_start_idx + current_image_feature.shape[0],
+                            "geometry_context": layerwise_sgf_contexts[cur_image_idx] if cur_image_idx < len(layerwise_sgf_contexts) else None,
+                        }
+                    )
                     
                 if labels is not None:
                     if history_waypoint_indice is not None and history_image_indice is not None:
@@ -834,6 +864,9 @@ class LLaMAVIDMetaForCausalLM(ABC):
                 new_attn_mask_pad_left = torch.full((attention_mask.shape[0], new_input_embeds.shape[1] - input_ids.shape[1]), True, dtype=attention_mask.dtype, device=attention_mask.device)
                 attention_mask = torch.cat((new_attn_mask_pad_left, attention_mask), dim=1)
                 assert attention_mask.shape == new_input_embeds.shape[:2]
+
+        if hasattr(self.get_model(), "_sgf_injection_plan"):
+            self.get_model()._sgf_injection_plan = sgf_injection_plan
 
         return None, attention_mask, past_key_values, new_input_embeds, new_labels
 

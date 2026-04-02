@@ -588,7 +588,7 @@ class LLaVATrainer(Trainer):
                     self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)
 
-                    self._maybe_log_save_evaluate(loss_dict, model, trial, epoch, ignore_keys_for_eval)
+                    self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
                 else:
                     self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
@@ -710,26 +710,16 @@ class LLaVATrainer(Trainer):
         return loss_dict
 
     
-    def _maybe_log_save_evaluate(self, loss_dict, model, trial, epoch, ignore_keys_for_eval):
+    def _maybe_log_save_evaluate(self, tr_loss, model, trial, epoch, ignore_keys_for_eval):
         if self.control.should_log:
             if is_torch_tpu_available():
                 xm.mark_step()
 
             logs: Dict[str, float] = {}
-            loss_dict_scalar = {}
-            
-            # all_gather + mean() to get average loss over all processes
-            for named_loss, tr_loss in loss_dict.items():
-                tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
-                loss_dict_scalar[named_loss] = tr_loss_scalar
-                
-            # reset tr_loss to zero
-            for tr_loss in loss_dict.values():
-                tr_loss -= tr_loss
+            tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
+            logs["loss"] = round(tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
+            tr_loss -= tr_loss
 
-            for named_loss, tr_loss_scalar in loss_dict_scalar.items():
-                logs[named_loss] = round(tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
-            
             logs["learning_rate"] = self._get_learning_rate()
 
             self._total_loss_scalar += tr_loss_scalar

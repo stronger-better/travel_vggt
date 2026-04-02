@@ -18,20 +18,12 @@ model_dir=$root_dir/Model/LLaMA-UAV
 VGGT_MODEL_PATH=/mnt/sfs_turbo_new/R10844/zhangpeilun/openuav_vggt/TravelUAV/vggt_checkpoints
 DEEPSPEED_INCLUDE=localhost:0,1,2,3,4,5,6,7
 MASTER_PORT=23101
-OUTPUT_DIR=$model_dir/work_dirs/new-evovle-geo-qwen-vid-7b-pretrain-224-uav-full-data-lora32
+OUTPUT_DIR=$model_dir/work_dirs/geothinker-paperlike-vicuna7b
 
-# GeoThinker formal training defaults baked into the launch command:
-# - 8 GPUs
-# - global batch size 64
-# - learning rate 1e-5
-# - warmup ratio 0.03
-# - 2 epochs
-# - cross-attention + importance gating
-# - 2 SGF injection points in the later half of the 32-layer Vicuna stack
-#
-# The public paper text/figure indicates SGF is inserted into selected multiple
-# VLM layers, but does not expose exact Vicuna-equivalent indices. We therefore
-# use a paper-like two-layer setting at layers 16 and 24 by default.
+# GeoThinker structure + feat/new-module-style optimization defaults:
+# - keep GeoThinker SGF/cross-attention/importance-gating settings
+# - use the more aggressive optimization/logging settings from feat/new-module
+# - keep the same effective global batch size (8 GPU x 4 x grad_acc 2 = 64)
 
 # Set visible CUDA devices if needed.
 # export CUDA_VISIBLE_DEVICES=5
@@ -77,16 +69,16 @@ deepspeed \
     --num_train_epochs 2 \
     --per_device_train_batch_size 4 \
     --per_device_eval_batch_size 1 \
-    --gradient_accumulation_steps 2 \
+    --gradient_accumulation_steps 1 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 500 \
-    --save_total_limit 2 \
-    --learning_rate 1e-5 \
+    --save_steps 1000 \
+    --save_total_limit 1 \
+    --learning_rate 5e-4 \
     --weight_decay 0.0 \
     --warmup_ratio 0.03 \
     --lr_scheduler_type cosine \
-    --logging_steps 10 \
+    --logging_steps 1 \
     --tf32 True \
     --model_max_length 2048 \
     --gradient_checkpointing True \

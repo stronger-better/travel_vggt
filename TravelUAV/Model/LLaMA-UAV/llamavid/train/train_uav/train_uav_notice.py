@@ -1156,6 +1156,9 @@ class DataCollatorForSupervisedDataset(object):
         if 'waypoint' in instances[0]:
             batch['waypoints'] = torch.stack([instance['waypoint'] for instance in instances])
             batch['historys'] = [instance['history_waypoint'] for instance in instances]
+
+        if 'is_help' in instances[0]:
+            batch['is_helps'] = torch.stack([instance['is_help'] for instance in instances]).view(-1).long()
         
         if 'orientation' in instances[0]:
             batch['orientations'] = torch.stack([instance['orientation'] for instance in instances])
@@ -1374,6 +1377,9 @@ def train():
             p.requires_grad = True
         for p in model.history_preprocessor.parameters():
             p.requires_grad = True
+        if hasattr(model, "is_help_predictor"):
+            for p in model.is_help_predictor.parameters():
+                p.requires_grad = True
 
     for name, param in model.named_parameters():
         if 'lora' in name:

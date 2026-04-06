@@ -113,6 +113,11 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
             nn.ReLU(),
             nn.Linear(4096 // 2, 4096),
         )
+        self.is_help_predictor = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(config.hidden_size // 2, 2)
+        )
         
         # ==========================================
         # VGGT Latent 提取器 初始化
@@ -169,6 +174,8 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
         self.waypoints_loss_func = torch.nn.L1Loss()
         self.angle_loss_func = CosineDirectionLoss()
         self.waypoint_loss_scale = 1.0
+        self.is_help_loss_func = torch.nn.CrossEntropyLoss()
+        self.is_help_loss_scale = 0.2
         self.special_token_dict = None
 
         # Initialize weights and apply final processing
@@ -176,6 +183,9 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
     
     def get_special_token_id(self, special_token_dict):
         self.special_token_dict = special_token_dict
+
+    def forward_is_help(self, hidden_states):
+        return self.is_help_predictor(hidden_states)
 
     def _freeze_vggt_model(self):
         self.vggt_model.eval()
@@ -337,6 +347,7 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
         vggt_images: Optional[torch.FloatTensor] = None, # [新增] VGGT 数据流
         prompts: Optional[List[str]] = None,
         waypoints: Optional[torch.FloatTensor] = None,
+        is_helps: Optional[torch.LongTensor] = None,
         orientations: Optional[torch.FloatTensor] = None,
         historys: Optional[torch.FloatTensor] = None,
         return_dict: Optional[bool] = None,
@@ -407,11 +418,13 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
         hidden_states = outputs[0]
         waypoints_feat = hidden_states[labels == WAYPOINT_LABEL_TOKEN]     
         predicted_waypoints = self.forward_waypoint(waypoints_feat)
+        predicted_is_help = self.forward_is_help(waypoints_feat)
         
         if waypoints is None and return_waypoints:
             return predicted_waypoints
         
         loss = None
+        help_loss = None
         
         assert len(torch.where(labels == WAYPOINT_LABEL_TOKEN)[0]) == waypoints.shape[0]
         if waypoints is not None:
@@ -421,6 +434,11 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
                 loss = waypoint_loss + angle_loss
             else:
                 loss = self.waypoint_loss_scale * self.waypoints_loss_func(predicted_waypoints, waypoints) 
+
+            if is_helps is not None:
+                is_helps = is_helps.to(device=predicted_is_help.device, dtype=torch.long).view(-1)
+                help_loss = self.is_help_loss_scale * self.is_help_loss_func(predicted_is_help, is_helps)
+                loss = loss + help_loss
         
         # ==========================================
         # [终极死锁修复] 强制将 vggt_latent_projector 挂载到计算图
@@ -443,6 +461,8 @@ class LlavaLlamaAttForCausalLM(LlamaUAVForCausalLM, LLaMAVIDMetaForCausalLM):
         
         return CausalLMOutputWithPastUAVMulLoss(
             loss=loss,
+            help_loss=help_loss,
+            is_help_loss=help_loss,
         )
 
     def prepare_inputs_for_generation(

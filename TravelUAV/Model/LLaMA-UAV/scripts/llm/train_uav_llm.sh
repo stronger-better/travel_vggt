@@ -46,7 +46,7 @@ deepspeed \
     $model_dir/llamavid/train/train_uav/train_uav_notice.py \
     --data_path $root_dir/data/uav_dataset/trainset.json \
     --dataset_path /mnt/sfs_turbo_new/R10844/zhangpeilun/project1/TravelUAV/dataset \
-    --output_dir $model_dir/work_dirs/new-evolve-evo-qwen-vid-7b-pretrain-224-uav-full-data-lora32 \
+    --output_dir $model_dir/work_dirs/test-new-evolve-evo-qwen-vid-7b-pretrain-224-uav-full-data-lora32 \
     --deepspeed $model_dir/scripts/zero2.json \
     --ddp_find_unused_parameters True \
     --model_name_or_path /mnt/sfs_turbo_new/R10844/zhangpeilun/openuav_vggt/TravelUAV/Model/LLaMA-UAV/model_zoo/vicuna-7b-v1.5 \
@@ -66,7 +66,7 @@ deepspeed \
     --pretrain_qformer /mnt/sfs_turbo_new/R10844/zhangpeilun/openuav_vggt/TravelUAV/Model/LLaMA-UAV/model_zoo/LAVIS/instruct_blip_vicuna7b_trimmed.pth \
     --compress_type "mean" \
     --bf16 True \
-    --num_train_epochs 4 \
+    --num_train_epochs 3 \
     --per_device_train_batch_size 4 \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 2 \
